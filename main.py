@@ -6,6 +6,7 @@ from collections import defaultdict
 import re
 import time
 import os
+import bert_score
 from lxml import etree
 import time
 import glob
@@ -201,7 +202,7 @@ def analyze_similarities():
 
 @app.command()
 def test_annotated(annotated_tsv: str):
-    import torch.nn.functional as F
+    import sacrebleu
     label_dict = {}
     for line in open(annotated_tsv):
         id_, label = line.strip().split("\t")
@@ -209,23 +210,19 @@ def test_annotated(annotated_tsv: str):
     ds = dataset.SummaryDataset("data", only_include=label_dict.keys())
     dev, test = ds.stratified_split(label_dict)
     data = dev
-    model = sentence_transformers.SentenceTransformer("sentence-transformers/sentence-t5-base")
-    embeddings_de = model.encode([pair[1].summaries["de"] for pair in data], show_progress_bar=True, convert_to_tensor=True)
-    embeddings_en = model.encode([pair[1].summaries["en"] for pair in data], show_progress_bar=True, convert_to_tensor=True)
-    sims = F.cosine_similarity(embeddings_de, embeddings_en)
-    label_tensor = torch.tensor([pair[0] for pair in data])
-    def get_metrics(label_tensor, sims, decision_boundary):
-        precision = label_tensor[sims < decision_boundary].sum() / len(label_tensor[sims < decision_boundary])
-        recall = label_tensor[sims < decision_boundary].sum() / label_tensor.sum()
-        f1 = 2 * (precision * recall / (precision + recall))
-        return precision, recall, f1
-    for decision_boundary in [0.8, 0.9, 0.91, 0.92, 0.93, 0.933, 0.934, 0.935, 0.936, 0.937, 0.94, 0.95]:
-        print("=====Decision Boundary", decision_boundary)
-        precision, recall, f1 = get_metrics(label_tensor, sims, decision_boundary)
-        print("Recall", recall)
-        print("Precision", precision)
-        print("F1", f1)
-    print(sims)
+    scorer = sacrebleu.BLEU()
+    scores = []
+    translated_texts, original_texts = [], []
+    for label, summary in data:
+        translated, original = summary.summaries_translated["de"], summary.summaries_original["en"]
+        translated_texts.append(translated)
+        original_texts.append(original)
+    p, r, f1 = bert_score.score(translated_texts, original_texts, lang="en")
+    # 0.88 is best!
+    for boundary in [x / 100 for x in range(100)][10:-10]:
+        print("========== BOUNDARY", boundary)
+        metrics = sklearn.metrics.classification_report([label for label, _ in data], f1 > boundary)
+        print(metrics)
 
 
 @app.command()
@@ -261,9 +258,12 @@ def add_translations(lang, translated_file: str, line_mapping_file: str):
         data_file_path = basename + ".json"
         temp_file_path = basename + ".temp"
         data = json.load(open(data_file_path))
-        data["en_translated_summaries"] = data.get("en_translated_summaries", [])
+        if lang not in data["summaries"].keys():
+            # This is a fix for summaries that were removed after the translations were made
+            continue
+        data["en_translated_summaries"] = data.get("en_translated_summaries", {})
         with open(temp_file_path, "w") as temp_file:
-            data["en_translated_summaries"].append({"text": text, "translation_tool": "nllb-200-3.3B", "source_lang": lang})
+            data["en_translated_summaries"][lang] = {"text": text, "translation_tool": "nllb-200-3.3B", "source_lang": lang}
             json.dump(data, temp_file)
         os.replace(temp_file_path, data_file_path)
 
@@ -290,6 +290,20 @@ def build_subset(out_path: str = "pairs.csv", in_path: str = "pairs_annotated.tx
     #    out_file.write(summary_en)
     #    out_file.write("\n\nIs translation? yn\n")
 
+
+@app.command()
+def stats():
+    ds = dataset.SummaryDataset("data")
+    results = ds.get_metadata_stats()
+    print(results)
+    genre_count_file = open("data/genre_counts.csv", "w")
+    for genre_id, count in results["genres"]:
+        genre_count_file.write(f"{genre_id},{count}\n")
+    return
+    results = ds.get_lang_stats(sentence_lengths=True)
+    print(results)
+    print(json.dumps(results))
+    json.dump(results, open("data/stats.json", "w"))
 
 @app.command()
 def sbert():
