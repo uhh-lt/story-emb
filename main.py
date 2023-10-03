@@ -1,5 +1,6 @@
 from wikidata.client import Client
 import json
+import itertools
 from pathlib import Path
 import random
 from collections import defaultdict
@@ -20,6 +21,7 @@ import sentence_transformers
 import ersatz
 import torch
 from itertools import groupby
+import sentence_transformers
 
 import dataset
 
@@ -200,29 +202,89 @@ def analyze_similarities():
     plt.hist(recalls, bins=41)
     plt.savefig("sims.pdf")
 
+
+def sentence_score(embs_a, embs_b):
+    """
+    Best-match sentence embedding similarity.
+    """
+    sims = sentence_transformers.util.cos_sim(embs_a, embs_b)
+    recall = sims.max(dim=0)[0].mean()
+    precision = sims.max(dim=1)[0].mean()
+    print(recall, precision)
+    f1 = 2 * precision * recall / (precision + recall)
+    return precision, recall, f1
+
+
+def similarity_scores(sentencized_docs, sbert_model):
+    embeddings = sbert_model.encode(list(itertools.chain.from_iterable(sentencized_docs)))
+    score_matrix = torch.zeros((len(sentencized_docs), len(sentencized_docs)), dtype=torch.float)
+    for i, sents in enumerate(sentencized_docs):
+        start_index = len(list(itertools.chain.from_iterable(sentencized_docs[:i])))
+        end_index = start_index + len(sents)
+        doc_a_embeddings = embeddings[start_index:end_index]
+        for j, sents in enumerate(sentencized_docs):
+            if i == j:
+                continue
+            start_index_j = len(list(itertools.chain.from_iterable(sentencized_docs[:j])))
+            end_index_j = start_index_j + len(sents)
+            doc_b_embeddings = embeddings[start_index_j:end_index_j]
+            if len(doc_a_embeddings) > 0 and len(doc_b_embeddings) > 0:
+                score_matrix[i][j] = sentence_score(doc_a_embeddings, doc_b_embeddings)[-1]
+    return score_matrix
+
+
+
+@app.command()
+def add_similarity_rating():
+    """
+    Adds sentence boundaries and similarity rating.
+    """
+    sbert_model = sentence_transformers.SentenceTransformer('all-MiniLM-L6-v2')
+    for file_name in tqdm(glob.glob("data/summaries/*/*.json"), desc="Splitting work summaries"):
+        data = json.load(open(file_name))
+        temp_file_path = os.path.splitext(file_name)[0] + ".temp"
+        texts = []
+        data["split_into_sents"] = {}
+        if data["summaries"].get("en") is not None:
+            split_original = ersatz.split_text(text=data["summaries"]["en"], model="en") or []
+            data["split_into_sents"]["en"] = split_original
+            texts.append(split_original)
+        for key, item in data.get("en_translated_summaries", {}).items():
+            split_original = ersatz.split_text(text=item["text"], model="en") or []
+            item["sentences"] = split_original
+            texts.append(split_original)
+        scores = similarity_scores(texts, sbert_model)
+        data["similarity"] = {
+            "indexes": (["en"] if data["summaries"].get("en") is not None else []) + list(data.get("en_translated_summaries", {}).keys()),
+            "similarities":  scores.tolist(),
+        }
+        json.dump(data, open(temp_file_path, "w"))
+        os.replace(temp_file_path, file_name)
+
 @app.command()
 def test_annotated(annotated_tsv: str):
-    import sacrebleu
+    sbert_model = sentence_transformers.SentenceTransformer('all-MiniLM-L6-v2')
     label_dict = {}
     for line in open(annotated_tsv):
         id_, label = line.strip().split("\t")
         label_dict[id_[1:]] = label == "True"
     ds = dataset.SummaryDataset("data", only_include=label_dict.keys())
     dev, test = ds.stratified_split(label_dict)
-    data = dev
-    scorer = sacrebleu.BLEU()
+    data = test
     scores = []
     translated_texts, original_texts = [], []
     for label, summary in data:
         translated, original = summary.summaries_translated["de"], summary.summaries_original["en"]
         translated_texts.append(translated)
         original_texts.append(original)
-    p, r, f1 = bert_score.score(translated_texts, original_texts, lang="en")
-    # 0.88 is best!
-    for boundary in [x / 100 for x in range(100)][10:-10]:
-        print("========== BOUNDARY", boundary)
-        metrics = sklearn.metrics.classification_report([label for label, _ in data], f1 > boundary)
-        print(metrics)
+        p, r, f1 = sentence_score(translated, original, sbert_model)
+        scores.append(f1)
+    # p, r, f1 = bert_score.score(translated_texts, original_texts, lang="en")
+    f1s = torch.tensor(scores)
+    boundary = 0.6
+    print("Boundary", boundary)
+    metrics = sklearn.metrics.classification_report([label for label, _ in data], f1s > boundary)
+    print(metrics)
 
 
 @app.command()
@@ -269,38 +331,27 @@ def add_translations(lang, translated_file: str, line_mapping_file: str):
 
 
 @app.command()
-def build_subset(out_path: str = "pairs.csv", in_path: str = "pairs_annotated.txt"):
-    PAIRS = re.compile(r"=*Summary Pair\n=========de===========\n(.*?)=========en===========\n(.*?)\n\n([A-Z\?]{1,10}\n)?Is translation\? (y|n)$", re.MULTILINE | re.DOTALL)
-    #PAIRS = re.compile(r"^=*Summary Pair\n=========de===========\n(.*?)=========en===========\n(.*?)\n\n[A-Z\n]*?Is translation? (y|n)$", re.MULTILINE | re.DOTALL)
-    text = "".join(open(in_path).readlines())
-    summaries, ids = get_all_summaries()
-    out_file = open(out_path, "w")
-    for match in PAIRS.findall(text):
-        de, en, _, label = match
-        label = label == "y"
-        wiki_id = summaries["de"].index(de)
-        out_file.write("\t".join([ids[wiki_id], str(label)]) + "\n")
-    #subset = random.choices(list(zip(summaries["de"], summaries["en"])), k=100)
-    #out_file = open(out_path, "w")
-    #for summary_de, summary_en in subset:
-    #    out_file.write("=======================================Summary Pair\n")
-    #    out_file.write("=========de===========\n")
-    #    out_file.write(summary_de)
-    #    out_file.write("=========en===========\n")
-    #    out_file.write(summary_en)
-    #    out_file.write("\n\nIs translation? yn\n")
+def build_subset(out_path: str = "sample.txt"):
+    ds = dataset.SummaryDataset("data")
+    stories = random.choices(list(ds.stories.values()), k=100)
+    for story in stories:
+        out_file = open(out_path, "w")
+        for story in stories:
+            out_file.write("=======================================Summary Pair\n")
+            out_file.write(story.title + "\t" + story.description + "\n")
+            for summary in story.get_all_summaries_en():
+                out_file.write("====================\n")
+                out_file.write(summary + "\n")
 
 
 @app.command()
 def stats():
     ds = dataset.SummaryDataset("data")
-    results = ds.get_metadata_stats()
-    print(results)
-    genre_count_file = open("data/genre_counts.csv", "w")
-    for genre_id, count in results["genres"]:
-        genre_count_file.write(f"{genre_id},{count}\n")
-    return
-    results = ds.get_lang_stats(sentence_lengths=True)
+    # results = ds.get_metadata_stats()
+    # genre_count_file = open("data/genre_counts.csv", "w")
+    # for genre_id, count in results["genres"]:
+    #     genre_count_file.write(f"{genre_id},{count}\n")
+    results = ds.get_lang_stats(sentence_lengths=False)
     print(results)
     print(json.dumps(results))
     json.dump(results, open("data/stats.json", "w"))
