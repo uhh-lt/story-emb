@@ -2,11 +2,27 @@ import glob
 import os
 from dataclasses import dataclass
 from collections import Counter, defaultdict
-from typing import Dict, List
+from typing import Dict, List, Optional
 from tqdm import tqdm
 import torch
 import json
 from sklearn.model_selection import StratifiedKFold
+import random
+import itertools
+
+TRANSLATION_SCORES = {
+    "en": 100,
+    "fr": 68.1,
+    "de": 67.4,
+    "it": 61.2,
+    "es": 59.1,
+}
+
+
+def get_genres(wikidata_dict):
+    genres = wikidata_dict["claims"].get("P136", [])
+    genre_ids = [e["mainsnak"]["datavalue"]["value"]["id"] for e in genres if e["mainsnak"]["snaktype"] != "novalue"]
+    return genre_ids
 
 
 @dataclass
@@ -17,11 +33,24 @@ class Story:
     title: str
     summaries_original: Dict[str, str]
     summaries_translated: Dict[str, str]
+    anonymized: Optional[Dict[str, str]]
     similarities: torch.Tensor
     similarities_labels: List[str]
+    num_sentences: Dict[str, int]
+    sentences: Dict[str, List[str]]
+    genres: List[str]
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data, wikidata_data=None):
+        if wikidata_data is not None:
+            genres = get_genres(wikidata_data)
+        else:
+            genres = []
+        sentences = {k: s["sentences"] for k, s in data.get("en_translated_summaries", {}).items()}
+        num_sentences = {k: len(s["sentences"]) for k, s in data.get("en_translated_summaries", {}).items()}
+        if "en" in (sents := data.get("split_into_sents")):
+            num_sentences.update({"en": len(sents["en"])})
+            sentences.update({"en": sents["en"]})
         return cls(
             wikidata_id=data["wikidata_id"],
             titles={k: (v or {}).get("value") for k, v in data.get("titles", {}).items()},
@@ -31,19 +60,29 @@ class Story:
             summaries_translated={k: s["text"] for k, s in data.get("en_translated_summaries", {}).items()},
             similarities_labels=data.get("similarity", {}).get("indexes"),
             similarities=torch.tensor(data.get("similarity", {}).get("similarities", [])),
+            anonymized=data.get("anonymized"),
+            num_sentences=num_sentences,
+            sentences=sentences,
+            genres=genres,
         )
 
-    def remove_duplicates(self, threshold=0.65):
+    def remove_duplicates(self, threshold=0.6):
         out = {}
-        for i, (lang, text) in enumerate(self.summaries_translated.items()):
+        sorted_labels = sorted(self.similarities_labels, key=lambda x: TRANSLATION_SCORES[x])
+        sorted_similarities = [[v.item() for k, v in sorted(
+            zip(self.similarities_labels, sim),
+            key=lambda kv: TRANSLATION_SCORES[kv[0]],
+            reverse=True
+        )] for sim in self.similarities]
+        for i, (lang, text) in enumerate(sorted(self.summaries_translated.items(), key=lambda kv: TRANSLATION_SCORES[kv[0]], reverse=True)):
             try:
-                index = (self.similarities_labels or []).index(lang)
+                index = (sorted_labels or []).index(lang)
             except ValueError:
                 breakpoint()
                 print(lang)
                 index = None
             try:
-                max_value = max(self.similarities[index][:i])
+                max_value = max(sorted_similarities[index][:i])
             except ValueError:
                 max_value = 0
             if index is not None and max_value > threshold:
@@ -52,33 +91,92 @@ class Story:
                 out[lang] = text
         return out
 
-    def get_all_summaries_en(self, max_similarity=0.65):
+    def get_anonymized(self, min_sentences=0):
+        return {lang : text for lang, text in self.anonymized.items() if self.num_sentences[lang] >= min_sentences}
+
+    def get_all_summaries_en(self, max_similarity=0.6, min_sentences=0):
         en = self.summaries_original.get("en")
         summaries = []
+        ids = []
         if en is not None:
             summaries.append(en)
-        summaries += [e for e in self.remove_duplicates().values()]
-        return summaries
+            ids.append("en")
+        no_dups = self.remove_duplicates() 
+        summaries += [e for e in no_dups.values()]
+        ids += [e for e in no_dups.keys()]
+        ids = [id_ for id_ in ids if self.num_sentences[id_] >= min_sentences]
+        summaries = [s for (id_, s) in zip(ids, summaries) if self.num_sentences[id_] >= min_sentences]
+        return ids, summaries
 
     def __repr__(self):
         return f"<Story title='{self.title}' description='{self.description}'>"
 
 
 class SummaryDataset():
-    def __init__(self, data_path, only_include=[]):
-        self.stories = {}
+    def __init__(self, data_path, only_include=[], stories=None):
+        self.stories = stories or {}
+        self.force_test_ids = set(open("data/test_ids.csv").readlines())
+        if len(self.stories) > 0:
+            return
         for file_name in glob.glob("data/summaries/*/*.json"):
             wikidata_id = os.path.splitext(os.path.basename(file_name))[0]
+            wikidata_data = json.load(open(f"data/wikidata/{wikidata_id[:2]}/{wikidata_id}.json"))
             if len(only_include) > 0 and (wikidata_id not in only_include):
                 continue
             else:
-                self.stories[wikidata_id] = Story.from_dict(json.load(open(file_name)))
+                self.stories[wikidata_id] = Story.from_dict(json.load(open(file_name)), wikidata_data)
 
     def __getitem__(self, i):
         return self.stories[i]
 
     def __len__(self):
         return len(self.stories)
+
+    def perform_splits(self):
+        test_stories = {id_: story for id_, story in self.stories.items() if id_ in self.force_test_ids}
+        train_len = int(len(self.stories) / 100 * 80)
+        dev_len = int(len(self.stories) / 100 * 10)
+        test_len = len(self.stories) - dev_len - train_len
+        to_split = list(set(self.stories.keys()) - set(test_stories.keys()))
+        randomizer = random.Random(42)
+        randomizer.shuffle(to_split)
+        train_stories = {k: self.stories[k] for k in to_split[:train_len]}
+        dev_stories = {k: self.stories[k] for k in to_split[train_len:train_len + dev_len]}
+        test_stories.update({k: self.stories[k] for k in to_split[train_len + dev_len:]})
+        return {k: self.__class__(data_path=None, stories=s) for k, s in [("train", train_stories), ("dev", dev_stories), ("test", test_stories)]}
+
+    def chaturvedi_like_split(self, use_anonymized: bool = False, seed=1337):
+        target_length_count = {
+            2: 235,
+            3: 20,
+            4: 10,
+            5: 7
+        }
+        randomizer = random.Random(seed)
+        ids = list(self.stories.keys())
+        randomizer.shuffle(ids)
+        by_length = defaultdict(list)
+        all_summaries = []
+        all_summaries_test = []
+        labels = []
+        labels_test = []
+        included = []
+        for id_ in ids:
+            if use_anonymized:
+                summaries = self.stories[id_].anonymized.values()
+            else:
+                _, summaries = self.stories[id_].get_all_summaries_en()
+            if len(by_length.get(len(summaries), [])) < target_length_count.get(len(summaries), 0):
+                in_test_set = [True if randomizer.random() <= 0.8 else False for _ in range(len(summaries))]
+                included.extend(in_test_set)
+                test_summaries = [s for t, s in zip(in_test_set, summaries) if t]
+                labels.extend([id_] * len(summaries))
+                labels_test.extend([id_] * len(test_summaries))
+                all_summaries.extend(summaries)
+                all_summaries_test.extend(summaries)
+                by_length[len(summaries)].append(summaries)
+        return all_summaries, labels, included
+        
 
     def stratified_split(self, label_dict, seed=2):
         splitter = StratifiedKFold(n_splits=2, random_state=seed, shuffle=True)
@@ -91,6 +189,8 @@ class SummaryDataset():
         has_gutenberg = 0
         has_isbn = 0
         genre_counter = Counter()
+        count = 0
+        neither_count = 0
         for _, story in tqdm(self.stories.items()):
             data = json.load(open(f"data/wikidata/{story.wikidata_id[1:3]}/{story.wikidata_id[1:]}.json"))
             genres = data["claims"].get("P136", [])
@@ -118,7 +218,14 @@ class SummaryDataset():
                 movie_count += 1
             if is_movie and is_book:
                 both_count += 1
+            if not is_movie and not is_book:
+                neither_count += 1
+                print(story.description)
+                print(story.wikidata_id)
+            count += 1
         return {
+            "neither_count": neither_count,
+            "story_count": count,
             "num_books": book_count,
             "num_movies": movie_count,
             "num_both": both_count,
