@@ -1,0 +1,24 @@
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX schema: <http://schema.org/>
+
+# Everything that is either a literary work or a movie
+SELECT ?work
+WHERE
+{
+  {
+     ?work wdt:P31 wd:Q7725634 .
+     OPTIONAL
+     {
+        ?work wdt:P31 wd:Q11424 .
+     }
+  }
+  UNION
+  {
+     ?work wdt:P31 wd:Q11424 .
+     OPTIONAL
+     {
+        ?work wdt:P31 wd:Q7725634 .
+     }
+  }
+ }
