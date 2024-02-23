@@ -503,6 +503,8 @@ def entities_test(use_anonymized: bool = False, min_length: int = 0, remake_like
 @app.command()
 def sbert_test(use_anonymized: bool = False, min_length: int = 0):
     from sentence_transformers.util import cos_sim
+    from sentence_transformers import SentenceTransformer, models
+
     ds = dataset.SummaryDataset("data")
     splits = ds.perform_splits()
     if use_anonymized:

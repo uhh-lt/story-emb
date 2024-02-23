@@ -9,6 +9,7 @@ import json
 from sklearn.model_selection import StratifiedKFold
 import random
 import itertools
+from datasets import Dataset
 
 TRANSLATION_SCORES = {
     "en": 100,
@@ -23,7 +24,6 @@ def get_genres(wikidata_dict):
     genres = wikidata_dict["claims"].get("P136", [])
     genre_ids = [e["mainsnak"]["datavalue"]["value"]["id"] for e in genres if e["mainsnak"]["snaktype"] != "novalue"]
     return genre_ids
-
 
 @dataclass
 class Story:
@@ -254,3 +254,70 @@ class SummaryDataset():
             "languages_direct_translations_removed": dict(counter_no_duplicates),
             "lengths_per_language": dict(length_counter),
         }
+
+
+def pair_combinations(iterable):
+    out = []
+    for i, a in enumerate(iterable):
+        for j, b in enumerate(iterable):
+            if i >= j:
+                continue
+            else:
+                out.append((a, b))
+    return out
+
+
+class SimilarityDataset():
+    def __init__(self, path, anonymized=True, min_sentences=0, negative_sample_scale=1.0, seed=42, min_length=0):
+        self.summary_dataset = SummaryDataset(path)
+        splits = self.summary_dataset.perform_splits()
+        self.summaries = {}
+        randomizer = random.Random(seed)
+        self.splits = {}
+        for split in ["train", "dev", "test"]:
+            if anonymized:
+                summaries_getter = lambda x, min_length: x.get_anonymized(min_sentences=min_length).values()
+            else:
+                summaries_getter = lambda x, min_length: v.get_all_summaries_en(min_sentences=min_length)[1]
+            positive_samples = list(
+                itertools.chain.from_iterable(
+                    [
+                        pair_combinations(summaries_getter(story, min_length))
+                        for story in splits[split].stories.values()
+                    ]
+                )
+            )
+            num_negative_samples = int(len(positive_samples) * negative_sample_scale)
+            negative_samples = []
+            stories = list(splits[split].stories.values())
+            for _ in range(num_negative_samples):
+                story_a = randomizer.choice(stories)
+                story_b = None
+                while story_b == story_a or story_b is None:
+                    story_b = randomizer.choice(stories)
+                negative_samples.append((
+                    randomizer.choice(list(story_b.get_anonymized().values())),
+                    randomizer.choice(list(story_b.get_anonymized().values()))
+                ))
+            negative_samples = [{"text_a": sample[0], "text_b": sample[1], "label": -1} for sample in negative_samples]
+            positive_samples = [{"text_a": sample[0], "text_b": sample[1], "label": 1} for sample in positive_samples]
+            samples = negative_samples + positive_samples
+            randomizer.shuffle(samples)
+            self.splits[split] = Dataset.from_list(samples)
+
+    def __getitem__(self, split):
+        return self.splits[split]
+
+
+class Split():
+    def __init__(self, items):
+        self.samples = items
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __iter__(self):
+        yield from self.samples
+
+    def __getitem__(self, i):
+        return self.samples[i]
