@@ -132,6 +132,9 @@ class SummaryDataset():
     def __len__(self):
         return len(self.stories)
 
+    def __iter__(self):
+        yield from self.stories.values()
+
     def perform_splits(self):
         test_stories = {id_: story for id_, story in self.stories.items() if id_ in self.force_test_ids}
         train_len = int(len(self.stories) / 100 * 80)
@@ -150,12 +153,13 @@ class SummaryDataset():
             2: 235,
             3: 20,
             4: 10,
-            5: 7
+            5: 1 # TODO: this should in all likelihood be 1 rather than 7, rerun experiments?
         }
         randomizer = random.Random(seed)
         ids = list(self.stories.keys())
         randomizer.shuffle(ids)
         by_length = defaultdict(list)
+        out_file = open("in_chaturvedi_test.csv", "w")
         all_summaries = []
         all_summaries_test = []
         labels = []
@@ -170,11 +174,15 @@ class SummaryDataset():
                 in_test_set = [True if randomizer.random() <= 0.8 else False for _ in range(len(summaries))]
                 included.extend(in_test_set)
                 test_summaries = [s for t, s in zip(in_test_set, summaries) if t]
+                for i, (is_in, summary) in enumerate(zip(in_test_set, summaries)):
+                    if is_in:
+                        out_file.write(id_ + f"_{i}\n")
                 labels.extend([id_] * len(summaries))
                 labels_test.extend([id_] * len(test_summaries))
                 all_summaries.extend(summaries)
                 all_summaries_test.extend(summaries)
                 by_length[len(summaries)].append(summaries)
+        out_file.close()
         return all_summaries, labels, included
         
 
@@ -268,7 +276,7 @@ def pair_combinations(iterable):
 
 
 class SimilarityDataset():
-    def __init__(self, path, anonymized=True, min_sentences=0, negative_sample_scale=1.0, seed=42, min_length=0):
+    def __init__(self, path, anonymized=True, min_sentences=0, negative_sample_scale=1.0, seed=42):
         self.summary_dataset = SummaryDataset(path)
         splits = self.summary_dataset.perform_splits()
         self.summaries = {}
@@ -276,13 +284,13 @@ class SimilarityDataset():
         self.splits = {}
         for split in ["train", "dev", "test"]:
             if anonymized:
-                summaries_getter = lambda x, min_length: x.get_anonymized(min_sentences=min_length).values()
+                summaries_getter = lambda x, min_length: x.get_anonymized(min_sentences=min_sentences).values()
             else:
-                summaries_getter = lambda x, min_length: v.get_all_summaries_en(min_sentences=min_length)[1]
+                summaries_getter = lambda x, min_length: v.get_all_summaries_en(min_sentences=min_sentences)[1]
             positive_samples = list(
                 itertools.chain.from_iterable(
                     [
-                        pair_combinations(summaries_getter(story, min_length))
+                        [(story.wikidata_id, pair) for pair in pair_combinations(summaries_getter(story, min_sentences))]
                         for story in splits[split].stories.values()
                     ]
                 )
@@ -295,12 +303,12 @@ class SimilarityDataset():
                 story_b = None
                 while story_b == story_a or story_b is None:
                     story_b = randomizer.choice(stories)
-                negative_samples.append((
+                negative_samples.append(([story_a.wikidata_id, story_b.wikidata_id], (
                     randomizer.choice(list(story_b.get_anonymized().values())),
                     randomizer.choice(list(story_b.get_anonymized().values()))
-                ))
-            negative_samples = [{"text_a": sample[0], "text_b": sample[1], "label": -1} for sample in negative_samples]
-            positive_samples = [{"text_a": sample[0], "text_b": sample[1], "label": 1} for sample in positive_samples]
+                )))
+            negative_samples = [{"text_a": sample[0], "text_b": sample[1], "label": -1, "text_ids": ids} for (ids, sample) in negative_samples]
+            positive_samples = [{"text_a": sample[0], "text_b": sample[1], "label": 1, "text_ids": [id_, id_]} for (id_, sample) in positive_samples]
             samples = negative_samples + positive_samples
             randomizer.shuffle(samples)
             self.splits[split] = Dataset.from_list(samples)
