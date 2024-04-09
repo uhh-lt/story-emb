@@ -48,14 +48,21 @@ class ContrastiveLlama(MistralModel):
 
 
 def get_model(base_model_name, adapter_model_name, for_training=True):
-    base_model = AutoModel.from_pretrained(base_model_name, device_map="auto") #, torch_dtype=torch.float16)
+    base_model = AutoModel.from_pretrained(base_model_name)#, device_map="auto") #, torch_dtype=torch.float16)
     if for_training:
         base_model.eval()
-    #peft_config = peft.LoraConfig(
-    #    inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1
-    #)
     #peft_model = peft.get_peft_model(base_model, peft_config)
-    base_model.load_adapter(adapter_model_name)
+    if adapter_model_name is None:
+        peft_config = peft.LoraConfig(
+            inference_mode=False,
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.1,
+        )
+        print(peft_config)
+        base_model.add_adapter(peft_config)
+    else:
+        base_model.load_adapter(adapter_model_name)
     return base_model
 
 @app.command()
@@ -257,19 +264,23 @@ class GradientCacheCallbacks(TrainerCallback):
 @app.command()
 def train():
     timestamp = datetime.utcnow().isoformat()
-    ds = dataset.SimilarityDataset("data", negative_sample_scale=0.0, min_sentences=20)
+    ds = dataset.SimilarityDataset("data", negative_sample_scale=0.0, min_sentences=20, clusters_together=True)
     base_model_name = "mistralai/Mistral-7B-v0.1"
+    # model = get_model(base_model_name, None)
     model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters")
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     tokenizer.pad_token = "[PAD]"
     tokenizer.padding_side = "left"
-    optimizer = torch.optim.Adam([p for name, p in model.named_parameters() if "lora" in name], lr=0.00005)
+    effective_batch_size = 100
+    base_lr = 5e-5
+    effective_lr = base_lr * effective_batch_size / 256 # Recommended in https://arxiv.org/pdf/2304.12210.pdf
+    optimizer = torch.optim.Adam([p for name, p in model.named_parameters() if "lora" in name], lr=effective_lr)
     training_args = TrainingArguments(
         "sim-trainer" + timestamp,
         evaluation_strategy="epoch",
         remove_unused_columns=False,
         gradient_accumulation_steps=1,
-        per_device_train_batch_size=400,
+        per_device_train_batch_size=effective_batch_size,
         logging_steps=1,
         save_steps=1,
         max_grad_norm=0.1,

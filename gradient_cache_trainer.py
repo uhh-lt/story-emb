@@ -12,6 +12,7 @@ from transformers.modeling_utils import unwrap_model
 from transformers.utils import is_peft_available, is_accelerate_available
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from torch.nn import functional
+from torch.utils.data import Sampler, SequentialSampler
 
 def _is_peft_model(model):
     return is_peft_available() and isinstance(model, PeftModel)
@@ -24,7 +25,6 @@ class ContrastiveMSELoss:
     def __call__(self, x: torch.Tensor, y: torch.Tensor, target: torch.Tensor = None, reduction: str = 'mean'):
         logits = torch.matmul(x, y.T)
         loss = functional.mse_loss(logits, target, reduction=reduction)
-        print(loss)
         return loss
 
 
@@ -105,3 +105,7 @@ class GradientCacheTrainer(Trainer):
                 loss = self.loss_fn(repr_a, repr_b, target=inputs["labels"])
 
         return (loss, torch.cat([repr_a, repr_b]), inputs["labels"])
+
+    def _get_train_sampler(self) -> Optional[Sampler]:
+        # We don't want to randomize the order...
+        return SequentialSampler(self.train_dataset)

@@ -275,8 +275,45 @@ def pair_combinations(iterable):
     return out
 
 
+def adjacent_pairs(iterable):
+    out = []
+    data = list(iterable)
+    for i in range(len(data)):
+        if i < len(iterable) - 1:
+            out.append((data[i], data[i + 1]))
+        else:
+            out.append((data[i], data[i - 1]))
+    return out
+
+
+def shuffle_into(shuffle_from, shuffle_into, randomizer=random):
+    ratio = len(shuffle_from) / (len(shuffle_into) + len(shuffle_from))
+    out = []
+    i = 0
+    j = 0
+    while (len(shuffle_from) + len(shuffle_into)) != len(out):
+        if i < len(shuffle_from) and j < len(shuffle_into):
+            if randomizer.random() < ratio:
+                out.append(shuffle_from[i])
+                i += 1
+            else:
+                out.append(shuffle_into[j])
+                j += 1
+        elif i < len(shuffle_from) and j == len(shuffle_into):
+            out.append(shuffle_from[i])
+            i += 1
+        elif i == len(shuffle_from) and j < len(shuffle_into):
+            out.append(shuffle_into[j])
+            j += 1
+    return out
+
+
+def remove_duplicates(x):
+    breakpoint()
+    return x
+
 class SimilarityDataset():
-    def __init__(self, path, anonymized=True, min_sentences=0, negative_sample_scale=1.0, seed=42):
+    def __init__(self, path, anonymized=True, min_sentences=0, negative_sample_scale=1.0, seed=42, clusters_together: bool = False):
         self.summary_dataset = SummaryDataset(path)
         splits = self.summary_dataset.perform_splits()
         self.summaries = {}
@@ -284,20 +321,24 @@ class SimilarityDataset():
         self.splits = {}
         for split in ["train", "dev", "test"]:
             if anonymized:
-                summaries_getter = lambda x, min_length: x.get_anonymized(min_sentences=min_sentences).values()
+                summaries_getter = lambda x, min_sentences: x.get_anonymized(min_sentences=min_sentences).values()
             else:
-                summaries_getter = lambda x, min_length: v.get_all_summaries_en(min_sentences=min_sentences)[1]
+                summaries_getter = lambda x, min_sentences: x.get_all_summaries_en(min_sentences=min_sentences)[1]
+            stories = list(splits[split].stories.values())
+            random.shuffle(stories)
+            combination_getter = lambda x: pair_combinations(x)
+            if clusters_together:
+                combination_getter = lambda x: adjacent_pairs(x)
             positive_samples = list(
                 itertools.chain.from_iterable(
                     [
-                        [(story.wikidata_id, pair) for pair in pair_combinations(summaries_getter(story, min_sentences))]
-                        for story in splits[split].stories.values()
+                        [(story.wikidata_id, pair) for pair in combination_getter(summaries_getter(story, min_sentences))]
+                        for story in stories
                     ]
                 )
             )
             num_negative_samples = int(len(positive_samples) * negative_sample_scale)
             negative_samples = []
-            stories = list(splits[split].stories.values())
             for _ in range(num_negative_samples):
                 story_a = randomizer.choice(stories)
                 story_b = None
@@ -309,8 +350,12 @@ class SimilarityDataset():
                 )))
             negative_samples = [{"text_a": sample[0], "text_b": sample[1], "label": -1, "text_ids": ids} for (ids, sample) in negative_samples]
             positive_samples = [{"text_a": sample[0], "text_b": sample[1], "label": 1, "text_ids": [id_, id_]} for (id_, sample) in positive_samples]
-            samples = negative_samples + positive_samples
-            randomizer.shuffle(samples)
+            if clusters_together:
+                random.shuffle(negative_samples)
+                samples = shuffle_into(negative_samples, positive_samples, randomizer)
+            else:
+                samples = negative_samples + positive_samples
+                randomizer.shuffle(samples)
             self.splits[split] = Dataset.from_list(samples)
 
     def __getitem__(self, split):
