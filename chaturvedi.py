@@ -42,20 +42,26 @@ def eval_model(model_name):
 class Summary:
     title: str
     text: str
+    text_anonymized: str
     cluster_id: int
     movie_id: int
 
 
 class MovieSummaryDataset(Dataset):
-    def __init__(self, path, test_instances_path):
+    def __init__(self, path, test_instances_path, csv_anon_path):
         data = {}
         self.summaries = []
         in_file = open(path)
         csv_reader = csv.reader(in_file, delimiter="\t")
+        if csv_anon_path:
+            csv_reader_anon = csv.reader(open(csv_anon_path), delimiter=",")
+        else:
+            csv_reader_anon = None
         test_instances_file = open(test_instances_path)
         next(test_instances_file)
         self.test_movies = set([int(l[1]) for l in csv.reader(test_instances_file)])
         for line in csv_reader:
+            print(line)
             cluster_id, *fields = line
             fields = [f.strip() for f in fields]
             cluster = list(split_into_three(fields))
@@ -72,9 +78,14 @@ class MovieSummaryDataset(Dataset):
             print("Out of", len(lengths), "there are", len([l for l in lengths if l == n]), f"clusters with length {n}")
         for cluster_id, summaries in data.items():
             for id_, title, text in summaries:
+                if csv_reader_anon is not None:
+                    text_anon = next(csv_reader_anon)[1]
+                else:
+                    text_anon = None
                 self.summaries.append(
                     Summary(
                         text=text,
+                        text_anonymized=text_anon,
                         cluster_id=int(cluster_id),
                         title=title,
                         movie_id=int(id_),
