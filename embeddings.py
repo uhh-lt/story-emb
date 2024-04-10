@@ -19,6 +19,9 @@ from dataclasses import dataclass
 from gradient_cache_trainer import GradientCacheTrainer, get_repr
 from news_sim import SemEvalDataset
 from scipy.stats import pearsonr
+from sklearn.metrics import classification_report
+
+from roc_stories import ROCStoriesDataset
 
 #MAX_INPUT_LENGTH = 5000
 MAX_INPUT_LENGTH = 50
@@ -90,8 +93,9 @@ def news():
     model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
     model = model.to(torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    tokenizer.pad_token = "[PAD]"
-    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
     train, dev = dataset_train.random_split(0.8)
     predicted_sims = []
     i = 0
@@ -264,16 +268,17 @@ class GradientCacheCallbacks(TrainerCallback):
 @app.command()
 def train():
     timestamp = datetime.utcnow().isoformat()
-    ds = dataset.SimilarityDataset("data", negative_sample_scale=0.0, min_sentences=20, clusters_together=True)
+    ds = dataset.SimilarityDataset("data", negative_sample_scale=0.0, min_sentences=10, clusters_together=True)
     base_model_name = "mistralai/Mistral-7B-v0.1"
     # model = get_model(base_model_name, None)
     model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters")
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    tokenizer.pad_token = "[PAD]"
-    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
     effective_batch_size = 100
     base_lr = 5e-5
-    effective_lr = base_lr * effective_batch_size / 256 # Recommended in https://arxiv.org/pdf/2304.12210.pdf
+    effective_lr = base_lr * effective_batch_size / 1024 # Recommended in https://arxiv.org/pdf/2304.12210.pdf
     optimizer = torch.optim.Adam([p for name, p in model.named_parameters() if "lora" in name], lr=effective_lr)
     training_args = TrainingArguments(
         "sim-trainer" + timestamp,
@@ -296,6 +301,44 @@ def train():
     )
     trainer.train()
 
+
+@app.command()
+def roc_stories(split: str = "dev"):
+    base_model_name = "mistralai/Mistral-7B-v0.1"
+    # model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters").to("cuda:0")
+    model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
+    model = model.to(torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+    ds = ROCStoriesDataset("../roc_stories", split)
+    labels = []
+    predictions = []
+    with torch.no_grad():
+        for item in tqdm(ds):
+            anchor = " ".join(item.sentences)
+            choices = [anchor + " " + s for s in item.candidate_endings]
+            batch = tokenizer([anchor] + choices, return_tensors="pt", padding=True).to("cuda:0")
+            encoded = model(**batch)
+            sim = get_repr(encoded) @ get_repr(encoded).transpose(0, 1)
+            prediction = (sim[0][1] < sim[0][2]).int()
+            predictions.append(prediction)
+            labels.append(item.label)
+    if split == "dev":
+        labels = torch.tensor(labels)
+        predictions = torch.tensor(predictions)
+        report = classification_report(labels, predictions)
+        print(report)
+    elif split == "test":
+        predictions = [p + 1 for p in predictions]
+        in_file = open("../roc_stories/cloze_test_test__winter2018-cloze_test_ALL_test - 1.csv", "r")
+        out_file = open("roc-stories-test.csv", "w")
+        out_file.write(next(in_file).strip() + ",AnswerRightEnding\r\n")
+        i = 0
+        for line in in_file:
+            out_file.write(line.strip() + "," + str(predictions[i].item()) + "\r\n")
+            i += 1
 
 
 if __name__ == "__main__":
