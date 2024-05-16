@@ -396,7 +396,12 @@ def genre_tsne():
 @app.command()
 def stats():
     ds = dataset.SummaryDataset("data")
+    counter = defaultdict(int)
+    for story in ds:
+        counter[len(story.get_all_summaries_en()[0])] += 1
+    print(counter)
     results = {
+        "cluster sizes": counter,
         "metadata": ds.get_metadata_stats(),
         "langauges": ds.get_lang_stats(sentence_lengths=False),
     }
@@ -516,11 +521,13 @@ def sbert_test(use_anonymized: bool = False, min_length: int = 0):
     print("Num summaries", len(texts))
     print("Num stories", len(splits["test"].stories.values()))
     print("Num stories (after length filtering)", len(set(labels)))
-    model_names = ["all-mpnet-base-v2", "sentence-transformers/sentence-t5-large", "finetuned-LaBSE-narrative",  "sentence-transformers/LaBSE"]
+    model_names = ["intfloat/multilingual-e5-small", "intfloat/e5-mistral-7b-instruct", "all-mpnet-base-v2", "sentence-transformers/sentence-t5-large", "finetuned-LaBSE-narrative",  "sentence-transformers/LaBSE"]
     out_file = open("sbert-test.csv", "w")
     for model_name in model_names:
-        model = sentence_transformers.SentenceTransformer(model_name)
-        encoded = model.encode(texts, show_progress_bar=True)
+        word_embedding_model = models.Transformer(model_name, max_seq_length=4096 if model_name == "intfloat/e5-mistral-7b-instruct" else 512, model_args={"torch_dtype": torch.float16})
+        pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode_lasttoken=True)
+        model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+        encoded = model.encode(["Retrieve semantically similar texts. " + t for t in texts], show_progress_bar=True)
         similarities = cos_sim(encoded, encoded)
         similarities.fill_diagonal_(0)
         matches = similarities.argmax(1)
@@ -556,6 +563,12 @@ def chaturvedi_comparison(use_anonymized: bool=False):
                 correct += 1
             total += 1
         print(model_name, "P@1", correct / total)
+
+
+@app.command()
+def chaturvedi():
+    from chaturvedi import MovieSummaryDataset
+    dataset = MovieSummaryDataset(Path(os.environ["MOVIE_REMAKE_PATH"]) / "movieRemakesManuallyCleaned.tsv", Path(os.environ["MOVIE_REMAKE_PATH"]) / "testInstances.csv")
 
 
 @app.command()

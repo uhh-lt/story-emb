@@ -19,12 +19,14 @@ from dataclasses import dataclass
 from gradient_cache_trainer import GradientCacheTrainer, get_repr
 from news_sim import SemEvalDataset
 from scipy.stats import pearsonr
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, silhouette_score
 
 from roc_stories import ROCStoriesDataset
+import tell_me_again
 
 #MAX_INPUT_LENGTH = 5000
-MAX_INPUT_LENGTH = 50
+MAX_INPUT_LENGTH = 5000
+QUERY_PREFIX = "Retrieve stories with similar narrative to the given story: "
 
 app = Typer()
     
@@ -51,10 +53,9 @@ class ContrastiveLlama(MistralModel):
 
 
 def get_model(base_model_name, adapter_model_name, for_training=True):
-    base_model = AutoModel.from_pretrained(base_model_name)#, device_map="auto") #, torch_dtype=torch.float16)
+    base_model = AutoModel.from_pretrained(base_model_name, device_map="auto") #, torch_dtype=torch.float16)
     if for_training:
         base_model.eval()
-    #peft_model = peft.get_peft_model(base_model, peft_config)
     if adapter_model_name is None:
         peft_config = peft.LoraConfig(
             inference_mode=False,
@@ -90,8 +91,7 @@ def news():
     news_similarity_path = Path(os.environ["NEWS_SIM_PATH"])
     dataset_train = SemEvalDataset(news_similarity_path / "train.csv", news_similarity_path / "all_data")
     dataset = SemEvalDataset(news_similarity_path / "eval.csv", news_similarity_path / "all_data")
-    model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
-    model = model.to(torch.float16)
+    model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False)
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -118,7 +118,7 @@ def news():
     
 
 @app.command()
-def chaturvedi(anonymized: bool = False, encode_query_separately: bool = False):
+def chaturvedi(model_path: str = "e5-mistral-7b-instruct-adapters", anonymized: bool = False, encode_query_separately: bool = False):
     """
     Checkpoint  Score
     ../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9 0.8047210300429185
@@ -133,7 +133,7 @@ def chaturvedi(anonymized: bool = False, encode_query_separately: bool = False):
     # TOdo: for e5 we need the task prefix to make it fair :/ (maybe, does it do symmetric embeddings)
     dataset = MovieSummaryDataset(Path(os.environ["MOVIE_REMAKE_PATH"]) / "movieRemakesManuallyCleaned.tsv", Path(os.environ["MOVIE_REMAKE_PATH"]) / "testInstances.csv", Path(os.environ["MOVIE_REMAKE_PATH"]) / "remakes-anon.csv")
     base_model_name = "mistralai/Mistral-7B-v0.1"
-    model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters", for_training=False).to("cuda:0")
+    model = get_model(base_model_name, model_path, for_training=False).to("cuda:0")
     # model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
     model = model.to(torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
@@ -142,19 +142,20 @@ def chaturvedi(anonymized: bool = False, encode_query_separately: bool = False):
     movie_ids = [s.movie_id for s in dataset]
     encoded = []
     encoded_queries = []
-    query_prefix = "Given a story summary, find a summary of a remake: "
+    # query_prefix = ""
+    print(QUERY_PREFIX)
     with torch.no_grad():
         for text in tqdm(texts):
-            batch = tokenizer(text, return_tensors="pt")
+            batch = tokenizer(QUERY_PREFIX + text, return_tensors="pt")
             output = model(**batch.to("cuda:0"))
             encoded.append(output.last_hidden_state[:,-1].to("cpu").squeeze())
             if encode_query_separately:
-                batch_query = tokenizer(query_prefix + text, return_tensors="pt")
+                batch_query = tokenizer(QUERY_PREFIX + text, return_tensors="pt")
                 output = model(**batch_query.to("cuda:0"))
                 encoded_queries.append(output.last_hidden_state[:,-1].to("cpu").squeeze())
     encoded = torch.stack(encoded)
-    encoded_queries = torch.stack(encoded_queries)
     if encode_query_separately:
+        encoded_queries = torch.stack(encoded_queries)
         similarities = cos_sim(encoded, encoded_queries)
     else:
         similarities = cos_sim(encoded, encoded)
@@ -251,13 +252,15 @@ class DataCollatorForSimilarityModeling:
         ids_b = ids[:, 1]
         target = (ids_a[:, None] == ids_b)
         #labels = torch.tensor([sample["label"] for sample in samples])
+        # length = max(texts_a["input_ids"].shape()[-1], texts_b["input_ids"].shape()[-1])
         return {"texts_a": texts_a, "texts_b": texts_b, "labels": target}
 
 
 def clip_texts(item):
     item.update({
-        "text_a": "Retrieve stories with a similar narrative. " + item["text_a"],
-        "text_b": "Retrieve stories with a similar narrative. " + item["text_b"],
+        "text_a": QUERY_PREFIX + item["text_a"],
+        "text_b": QUERY_PREFIX + item["text_b"],
+        "length": max([len(item["text_a"]), len(item["text_b"])]),
     })
     return item
 
@@ -268,7 +271,7 @@ class GradientCacheCallbacks(TrainerCallback):
 @app.command()
 def train():
     timestamp = datetime.utcnow().isoformat()
-    ds = dataset.SimilarityDataset("data", negative_sample_scale=0.0, min_sentences=10, clusters_together=True)
+    ds = dataset.SimilarityDataset("data", negative_sample_scale=0.0, min_sentences=10, max_sentences=50)
     base_model_name = "mistralai/Mistral-7B-v0.1"
     # model = get_model(base_model_name, None)
     model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters")
@@ -276,10 +279,12 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
-    effective_batch_size = 100
+    effective_batch_size = 1024
     base_lr = 5e-5
-    effective_lr = base_lr * effective_batch_size / 1024 # Recommended in https://arxiv.org/pdf/2304.12210.pdf
-    optimizer = torch.optim.Adam([p for name, p in model.named_parameters() if "lora" in name], lr=effective_lr)
+    # effective_lr = base_lr * effective_batch_size / 1024 # Recommended in https://arxiv.org/pdf/2304.12210.pdf
+    optimizer = torch.optim.Adam([p for name, p in model.named_parameters() if "lora" in name], lr=base_lr)
+    num_steps = (len(ds["train"]) // effective_batch_size) + 1
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, effective_lr, total_steps=num_steps, pct_start=0.1)
     training_args = TrainingArguments(
         "sim-trainer" + timestamp,
         evaluation_strategy="epoch",
@@ -288,8 +293,11 @@ def train():
         per_device_train_batch_size=effective_batch_size,
         logging_steps=1,
         save_steps=1,
-        max_grad_norm=0.1,
+        max_grad_norm=3,
         fp16=True,
+        num_train_epochs=1,
+        # length_column_name="length",
+        # group_by_length=True, # This can substantially speed up training
     )
     trainer = GradientCacheTrainer(
         model,
@@ -297,21 +305,25 @@ def train():
         train_dataset=ds["train"].map(clip_texts),
         eval_dataset=ds["dev"].map(clip_texts),
         data_collator=DataCollatorForSimilarityModeling(tokenizer),
-        optimizers=[optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)],
+        optimizers=[optimizer, None],
     )
     trainer.train()
 
 
-@app.command()
-def roc_stories(split: str = "dev"):
-    base_model_name = "mistralai/Mistral-7B-v0.1"
-    # model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters").to("cuda:0")
-    model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
+def prepare_model_and_tokenizer(base_model_name, adapter_name):
+    model = get_model(base_model_name, adapter_name, for_training=False)
     model = model.to(torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
+    return model, tokenizer
+
+@app.command()
+def roc_stories(split: str = "dev", adapter_name: str="../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9"):
+    base_model_name = "mistralai/Mistral-7B-v0.1"
+    # model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters").to("cuda:0")
+    model, tokenizer = prepare_model_and_tokenizer(base_model_name, adapter_name)
     ds = ROCStoriesDataset("../roc_stories", split)
     labels = []
     predictions = []
@@ -340,6 +352,74 @@ def roc_stories(split: str = "dev"):
             out_file.write(line.strip() + "," + str(predictions[i].item()) + "\r\n")
             i += 1
 
+@app.command()
+def genres():
+    """
+    Distinguishing between crime and thriller is more or less impossible for our models
+    e5: 0.017751
+    ../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9: 0.042648430
+
+    Crime vs romance:
+    e5: 0.03778897459761644
+    ../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9: 0.11215
+
+    This can be considered a bit of an improvement, but we will need to check tsne tbh.
+    Either way: there is a slight improvement but it is not enough for any usecase. Hardly surprising as we are essentially also training on this (but keep in mind there are many overlapping samples in the training data).
+    
+    This function is somehow not quite deterministic i.e. I had different sizes for the categories.
+    """
+    base_model_name = "mistralai/Mistral-7B-v0.1"
+    adapter_name = "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9"
+    #adapter_name = "e5-mistral-7b-instruct-adapters"
+    model, tokenizer = prepare_model_and_tokenizer(base_model_name, adapter_name)
+    genre_to_id = {x.split(",")[0]: x.split(",")[1] for x in open("data/genres/joined.csv").readlines()}
+    id_to_genre = {v : k for k, v in genre_to_id.items()}
+    genres = ["crime film", "romance film"]
+    banned_genres = []
+    genre_ids =  [genre_to_id[g_id] for g_id in genres]
+    banned_genre_ids =  [genre_to_id[g_id] for g_id in banned_genres]
+    # We need to require that they are only in exactly one of the pair
+    stories = tell_me_again.StoryDataset().perform_splits()["dev"]
+    stories_per_genre = defaultdict(list)
+    to_embed = []
+    labels = []
+    for story in stories:
+        shared_genres = set(story.genres) & set(genre_ids)
+        if len(shared_genres) == 1 and len(set(story.genres) & set(banned_genre_ids)) == 0:
+            genre = list(shared_genres)[0]
+            stories_per_genre[genre].append(story)
+            try:
+                to_embed.append(story.summaries_original["en"])
+            except KeyError:
+                to_embed.append(
+                    list(sorted(story.summaries_translated.values(), key=lambda x: len(x)))[0]
+                )
+            labels.append(genre == genre_to_id["crime film"])
+    for k, v in stories_per_genre.items():
+        print(id_to_genre[k], len(v))
+    encoded = []
+    with torch.no_grad():
+        for s in tqdm(to_embed):
+            batch = tokenizer(s, return_tensors="pt", padding="max_length", truncation=True, max_length=MAX_INPUT_LENGTH).to("cuda:0")
+            embedding = get_repr(model(**batch))
+            encoded.append(embedding.squeeze())
+    encoded = torch.stack(encoded)
+    sims = encoded @ encoded.transpose(0, 1)
+    dists = 1 - sims
+    dists.fill_diagonal_(0.0)
+    score = silhouette_score(dists.cpu(), labels, metric="precomputed")
+    print(score)
+    
+
+@app.command()
+def sim_delta():
+    """
+    Find texts with a very large delta in similarity from one model to another.
+    """
+    stories = tell_me_again.StoryDataset().perform_splits()["dev"]
+    for story in stories:
+        print(story)
+    # Output some html here
 
 if __name__ == "__main__":
     app()

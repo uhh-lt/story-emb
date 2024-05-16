@@ -61,7 +61,6 @@ class MovieSummaryDataset(Dataset):
         next(test_instances_file)
         self.test_movies = set([int(l[1]) for l in csv.reader(test_instances_file)])
         for line in csv_reader:
-            print(line)
             cluster_id, *fields = line
             fields = [f.strip() for f in fields]
             cluster = list(split_into_three(fields))

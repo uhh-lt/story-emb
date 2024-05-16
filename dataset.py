@@ -313,17 +313,18 @@ def remove_duplicates(x):
     return x
 
 class SimilarityDataset():
-    def __init__(self, path, anonymized=True, min_sentences=0, negative_sample_scale=1.0, seed=42, clusters_together: bool = False):
-        self.summary_dataset = SummaryDataset(path)
+    def __init__(self, path, anonymized=True, min_sentences=0, max_sentences=20, negative_sample_scale=1.0, seed=42, clusters_together: bool = False):
+        from tell_me_again import StoryDataset
+        self.summary_dataset = StoryDataset()
         splits = self.summary_dataset.perform_splits()
         self.summaries = {}
         randomizer = random.Random(seed)
         self.splits = {}
         for split in ["train", "dev", "test"]:
             if anonymized:
-                summaries_getter = lambda x, min_sentences: x.get_anonymized(min_sentences=min_sentences).values()
+                summaries_getter = lambda x, min_sentences: x.get_anonymized(min_sentences=min_sentences, max_sentences=max_sentences).values()
             else:
-                summaries_getter = lambda x, min_sentences: x.get_all_summaries_en(min_sentences=min_sentences)[1]
+                summaries_getter = lambda x, min_sentences: x.get_all_summaries_en(min_sentences=min_sentences, max_sentences=max_sentences)[1]
             stories = list(splits[split].stories.values())
             random.shuffle(stories)
             combination_getter = lambda x: pair_combinations(x)
@@ -345,8 +346,8 @@ class SimilarityDataset():
                 while story_b == story_a or story_b is None:
                     story_b = randomizer.choice(stories)
                 negative_samples.append(([story_a.wikidata_id, story_b.wikidata_id], (
-                    randomizer.choice(list(story_b.get_anonymized().values())),
-                    randomizer.choice(list(story_b.get_anonymized().values()))
+                    randomizer.choice(list(story_b.get_anonymized(min_sentences=min_sentences, max_sentences=max_sentences).values())),
+                    randomizer.choice(list(story_b.get_anonymized(min_sentences=min_sentences, max_sentences=max_sentences).values()))
                 )))
             negative_samples = [{"text_a": sample[0], "text_b": sample[1], "label": -1, "text_ids": ids} for (ids, sample) in negative_samples]
             positive_samples = [{"text_a": sample[0], "text_b": sample[1], "label": 1, "text_ids": [id_, id_]} for (id_, sample) in positive_samples]

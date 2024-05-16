@@ -24,8 +24,10 @@ class ContrastiveMSELoss:
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor, target: torch.Tensor = None, reduction: str = 'mean'):
         logits = torch.matmul(x, y.T)
-        loss = functional.mse_loss(logits, target, reduction=reduction)
-        return loss
+        loss = functional.mse_loss(logits, target, reduce=False)
+        negative_loss_scale = (~target.bool()).sum() / target.numel()
+        loss_scale_matrix = torch.where(target == 1, target, negative_loss_scale)
+        return (loss * loss_scale_matrix).mean()
 
 
 def get_repr(v):
@@ -40,7 +42,8 @@ class GradientCacheTrainer(Trainer):
         self.gradient_cache = GradCache(
             models=[model, model],
             chunk_sizes=2,
-            loss_fn=self.loss_fn,
+            loss_fn=SimpleContrastiveLoss(),
+            # loss_fn=self.loss_fn,
             get_rep_fn=get_repr,
             fp16=True,
             scaler="placeholder" # Scaler is not initilaized on the trainer yet, so we assign it in the training step
@@ -106,6 +109,6 @@ class GradientCacheTrainer(Trainer):
 
         return (loss, torch.cat([repr_a, repr_b]), inputs["labels"])
 
-    def _get_train_sampler(self) -> Optional[Sampler]:
-        # We don't want to randomize the order...
-        return SequentialSampler(self.train_dataset)
+    # def _get_train_sampler(self) -> Optional[Sampler]:
+    #     # We don't want to randomize the order...
+    #     return SequentialSampler(self.train_dataset)
