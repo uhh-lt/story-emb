@@ -218,7 +218,6 @@ def eval_similarities(gold_sims, predicted_sims):
         rows = torch.arange(gold_sims.size(0)).unsqueeze(1)
         is_in_topk[rows, top_k_indices] = 1
         at_n = gold_sims.sum(1) == k
-        p_at_k = (is_in_topk.int() & gold_sims.int()).sum(1) / gold_sims.sum(1)
         p_at_k = ((is_in_topk.int() & gold_sims.int()).sum(1) / k)
         p_at_n.append(p_at_k.masked_select(at_n))
         if k == 1:
