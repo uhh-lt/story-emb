@@ -44,7 +44,7 @@ class Summary:
     text: str
     text_anonymized: str
     cluster_id: int
-    movie_id: int
+    movie_id: str
 
 
 class MovieSummaryDataset(Dataset):
@@ -59,7 +59,7 @@ class MovieSummaryDataset(Dataset):
             csv_reader_anon = None
         test_instances_file = open(test_instances_path)
         next(test_instances_file)
-        self.test_movies = set([int(l[1]) for l in csv.reader(test_instances_file)])
+        self.test_movies = set([l[1] for l in csv.reader(test_instances_file)])
         for line in csv_reader:
             cluster_id, *fields = line
             fields = [f.strip() for f in fields]
@@ -87,7 +87,7 @@ class MovieSummaryDataset(Dataset):
                         text_anonymized=text_anon,
                         cluster_id=int(cluster_id),
                         title=title,
-                        movie_id=int(id_),
+                        movie_id=id_,
                     )
                 )
 

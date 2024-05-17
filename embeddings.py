@@ -24,8 +24,8 @@ from sklearn.metrics import classification_report, silhouette_score
 from roc_stories import ROCStoriesDataset
 import tell_me_again
 
-#MAX_INPUT_LENGTH = 5000
 MAX_INPUT_LENGTH = 5000
+#MAX_INPUT_LENGTH = 8192
 QUERY_PREFIX = "Retrieve stories with similar narrative to the given story: "
 
 app = Typer()
@@ -196,14 +196,54 @@ def token_lengths(use_anonymized: bool = True, min_length: int = 0, split: str =
     # The results basically tell us: 3k should be plenty
 
 
+def eval_similarities(gold_sims, predicted_sims):
+    """
+    Given NxN matrices returns a dict with all relevant eval metrics.
+    """
+    from torchmetrics.retrieval import RetrievalMAP, RetrievalNormalizedDCG, RetrievalRPrecision
+    results = {}
+    map_scorer = RetrievalMAP("error")
+    ndcg_scorer = RetrievalNormalizedDCG("error")
+    r_precision_scorer = RetrievalRPrecision("error")
+    query_id = torch.arange(gold_sims.shape[1]).unsqueeze(1).repeat(1, gold_sims.shape[1])
+    predicted_sims = predicted_sims.fill_diagonal_(0)
+    results["MAP"] = map_scorer(predicted_sims.flatten(), gold_sims.flatten().bool(), indexes=query_id.flatten().long()).item()
+    results["ndcg"] = ndcg_scorer(predicted_sims.flatten(), gold_sims.flatten().bool(), indexes=query_id.flatten().long()).item()
+    results["r-precision"] = r_precision_scorer(predicted_sims.flatten(), gold_sims.flatten().bool(), indexes=query_id.flatten().long()).item()
+    max_cluster_size = gold_sims.sum(1).max()
+    p_at_n = []
+    for k in range(1, max_cluster_size.int().item()):
+        is_in_topk = torch.zeros_like(predicted_sims)
+        _top_k_values, top_k_indices = predicted_sims.topk(k, dim=1)
+        rows = torch.arange(gold_sims.size(0)).unsqueeze(1)
+        is_in_topk[rows, top_k_indices] = 1
+        at_n = gold_sims.sum(1) == k
+        p_at_k = (is_in_topk.int() & gold_sims.int()).sum(1) / gold_sims.sum(1)
+        p_at_k = ((is_in_topk.int() & gold_sims.int()).sum(1) / k)
+        p_at_n.append(p_at_k.masked_select(at_n))
+        if k == 1:
+            results[f"P@{k}"] = p_at_k.mean().item()
+    results["P@N"] = torch.cat(p_at_n).mean().item()
+    return results
+
+
+def label_list_to_matrix(labels):
+    out = torch.zeros(len(labels), len(labels))
+    for x in range(labels.max() + 1):
+        matches = (labels == x).to(int)
+        out += matches.unsqueeze(0) * matches.unsqueeze(1)
+    out.fill_diagonal_(0)
+    return out
+        
+
 @app.command()
-def llama_test(use_anonymized: bool = True, min_length: int = 0, batch_size: int = 1, split: str = "dev", quick: bool=False, collect_lengths: bool = False):
+def test(use_anonymized: bool = True, adapter_path: str = "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", min_length: int = 0, batch_size: int = 1, split: str = "dev", quick: bool=False, collect_lengths: bool = False):
     base_model_name = "mistralai/Mistral-7B-v0.1"
     #model = get_model(base_model_name, "sim-trainer2024-02-21T19:26:14.519764/checkpoint-1500/", for_training=False).to("cuda:0"): 0.88
-    model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
+    model = get_model(base_model_name, adapter_path, for_training=False).to("cuda:0")
     model = model.to(torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    ds = dataset.SummaryDataset("data")
+    ds = tell_me_again.StoryDataset()
     splits = ds.perform_splits()
     if use_anonymized:
         all_labeled = list(itertools.chain.from_iterable([zip(itertools.repeat(i), v.get_anonymized(min_sentences=min_length).values()) for i, v in enumerate(splits[split].stories.values())]))
@@ -212,12 +252,12 @@ def llama_test(use_anonymized: bool = True, min_length: int = 0, batch_size: int
     all_labeled = [(id_, text) for id_, text in all_labeled if min_length is None or len(text) >= min_length]
     labels, texts = zip(*all_labeled)
     if quick:
-        labels = labels[:1000]
-        texts = texts[:1000]
+        labels = labels[:100]
+        texts = texts[:100]
     batches = []
-    texts = ["Retrieve stories with a similar narrative." + t for t in texts] # let's not make them too long
-    for texts_for_batch in more_itertools.chunked(texts, batch_size):
-        tokenized = tokenizer(texts_for_batch, return_tensors="pt", max_length=4096)
+    texts = [QUERY_PREFIX + t for t in texts] # let's not make them too long
+    for texts_for_batch in tqdm(more_itertools.chunked(texts, batch_size)):
+        tokenized = tokenizer(texts_for_batch, return_tensors="pt", max_length=MAX_INPUT_LENGTH)
         batches.append(tokenized)
     model.eval()
     batches_encoded = []
@@ -236,6 +276,7 @@ def llama_test(use_anonymized: bool = True, min_length: int = 0, batch_size: int
             correct += 1
         total += 1
     print("P@1", correct / total)
+    print(eval_similarities(label_list_to_matrix(torch.tensor(labels)), similarities))
     # With anonymization: 0.139
     # W/o anonymiztaion: 0.596
     # These are not competitive with e.g. sentence-T5
@@ -271,7 +312,7 @@ class GradientCacheCallbacks(TrainerCallback):
 @app.command()
 def train():
     timestamp = datetime.utcnow().isoformat()
-    ds = dataset.SimilarityDataset("data", negative_sample_scale=0.0, min_sentences=10, max_sentences=50)
+    ds = dataset.SimilarityDataset("data", negative_sample_scale=0.0, min_sentences=10, max_sentences=50, clusters_together=True)
     base_model_name = "mistralai/Mistral-7B-v0.1"
     # model = get_model(base_model_name, None)
     model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters")
@@ -329,7 +370,7 @@ def roc_stories(split: str = "dev", adapter_name: str="../sim-trainer-checkpoint
     predictions = []
     with torch.no_grad():
         for item in tqdm(ds):
-            anchor = " ".join(item.sentences)
+            anchor = QUERY_PREFIX + " ".join(item.sentences)
             choices = [anchor + " " + s for s in item.candidate_endings]
             batch = tokenizer([anchor] + choices, return_tensors="pt", padding=True).to("cuda:0")
             encoded = model(**batch)
@@ -418,8 +459,51 @@ def sim_delta():
     """
     stories = tell_me_again.StoryDataset().perform_splits()["dev"]
     for story in stories:
-        print(story)
+        en_summary = story.summaries_original.get("en")
+        if en_summary is not None:
+            en_summary
     # Output some html here
+
+@app.command()
+def retellings(model_path: str = "e5-mistral-7b-instruct-adapters", anonymized: bool = False, encode_query_separately: bool = False):
+    dataset = MovieSummaryDataset("data/retellings/movieRemakesManuallyCleaned.tsv", "data/retellings/testInstances.csv", None)
+    base_model_name = "mistralai/Mistral-7B-v0.1"
+    model = get_model(base_model_name, model_path, for_training=False).to("cuda:0")
+    model = model.to(torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    texts = [s.text_anonymized if anonymized else s.text for s in dataset]
+    cluster_ids = [s.cluster_id for s in dataset]
+    movie_ids = [s.movie_id for s in dataset]
+    encoded = []
+    encoded_queries = []
+    # query_prefix = ""
+    print(QUERY_PREFIX)
+    with torch.no_grad():
+        for text in tqdm(texts):
+            batch = tokenizer(QUERY_PREFIX + text, return_tensors="pt")
+            output = model(**batch.to("cuda:0"))
+            encoded.append(output.last_hidden_state[:,-1].to("cpu").squeeze())
+            if encode_query_separately:
+                batch_query = tokenizer(QUERY_PREFIX + text, return_tensors="pt")
+                output = model(**batch_query.to("cuda:0"))
+                encoded_queries.append(output.last_hidden_state[:,-1].to("cpu").squeeze())
+    encoded = torch.stack(encoded)
+    if encode_query_separately:
+        encoded_queries = torch.stack(encoded_queries)
+        similarities = cos_sim(encoded, encoded_queries)
+    else:
+        similarities = cos_sim(encoded, encoded)
+    similarities.fill_diagonal_(0)
+    match = similarities.argmax(1)
+    total = 0
+    correct = 0
+    for a, b in enumerate(match):
+        if movie_ids[a] not in dataset.test_movies:
+            continue
+        if cluster_ids[a] == cluster_ids[b]:
+            correct += 1
+        total += 1
+    print(correct / total)
 
 if __name__ == "__main__":
     app()

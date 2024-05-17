@@ -783,5 +783,79 @@ def get_ner(doc, cluster):
     doc.ner_
     pass
 
+def normalize_title(title):
+    return title.lower().replace(" ", "_")
+
+@app.command()
+def scrape_retellings():
+    client = build_clients()["enwiki"]
+    in_file = open("data/retellings_chatgpt_links.csv")
+    for line in csv.reader(in_file):
+        title_a, url_a, title_b, url_b = line
+        pages = []
+        for title, url in [(title_a, url_a), (title_b, url_b)]:
+            *_, page_title = url.split("/")
+            page = client.page(page_title)
+            sections = {s.title : s.full_text() for s in page.sections}
+            out_file = open(f"data/retellings/wikipedia/{normalize_title(title)}.json", "w")
+            json.dump(sections, out_file)
+            pages.append(page)
+            time.sleep(1)
+
+@app.command()
+def extract_retellings():
+    for fn in glob.glob("data/retellings/wikipedia/*.json"):
+        data = json.load(open(fn))
+        try:
+            section_title, summary = extract_summary(data, "en")
+            name, _old_ext = os.path.splitext(os.path.split(fn)[1])
+            out_file = open(Path("data/retellings/summaries") / (name + ".txt"), "w")
+            out_file.write(html_to_plain(summary))
+            out_file.close()
+        except TypeError:
+            continue
+
+
+@app.command()
+def retellings_to_csv():
+    in_file = open("data/retellings_chatgpt_links.csv")
+    clusters_file = open("data/retellings/testInstances.csv", "w")
+    stories_file = open("data/retellings/movieRemakesManuallyCleaned.tsv", "w")
+    clusters = []
+    texts = {}
+    for line in csv.reader(in_file):
+        title_a, _, title_b, _ = line
+        title_a, title_b = normalize_title(title_a), normalize_title(title_b)
+        skip_pair = False
+        for title in [title_a, title_b]:
+            try:
+                text_file = open(Path("data/retellings/summaries/") / (normalize_title(title) + ".txt"))
+                summary_text = "\n".join(text_file.readlines())
+                texts[title] = summary_text
+            except FileNotFoundError:
+                skip_pair = True
+            if len(summary_text.strip()) == 0:
+                skip_pair = True
+        if skip_pair:
+            continue
+        found = False
+        for cluster in clusters:
+            if title_a in cluster or title_b in cluster:
+                cluster |= set([title_a, title_b])
+                found = True
+                break
+        if not found:
+            clusters.append(set([title_a, title_b]))
+    for cluster_id, cluster in enumerate(clusters):
+        for member in cluster:
+            print(f"{cluster_id},{member}", file=clusters_file)
+    for cluster_id, cluster in enumerate(clusters):
+        fields = [str(cluster_id)]
+        for cluster_member in cluster:
+            text = texts[cluster_member].replace("\n", " ").replace("\t", " ")
+            fields += [cluster_member, cluster_member, text]
+            line = "\t".join(fields)
+            print(line, file=stories_file)
+
 if __name__ == "__main__":
     app()
