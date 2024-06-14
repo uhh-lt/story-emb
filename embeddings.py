@@ -32,10 +32,12 @@ from gradient_cache_trainer import (
     GradientCacheTrainer,
     LLM2VecGradientCacheTrainer,
     get_repr,
+    get_repr_mean,
 )
 from news_sim import SemEvalDataset
 from scipy.stats import pearsonr
 from sklearn.metrics import classification_report, silhouette_score
+from sentence_transformers import SentenceTransformer
 
 from roc_stories import ROCStoriesDataset
 import tell_me_again
@@ -71,6 +73,36 @@ class ContrastiveLlama(MistralModel):
 
 
 def get_model(base_model_name, adapter_model_name, for_training=True):
+    if "LLM2Vec" in base_model_name:
+        return _get_model_llm2vec(base_model_name, adapter_model_name, for_training=for_training)
+    else:
+        return _get_model_e5(base_model_name, adapter_model_name, for_training=for_training)
+
+
+def _get_model_llm2vec(base_model_name, adapter_model_name, for_training=True):
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_name
+    )
+    config = AutoConfig.from_pretrained(
+        base_model_name,
+        trust_remote_code=True,
+    )
+    model = AutoModel.from_pretrained(
+        base_model_name,
+        trust_remote_code=True,
+        config=config,
+        device_map="auto",
+    )
+    model = PeftModel.from_pretrained(
+        model,
+        adapter_model_name,
+        is_trainable=for_training,
+        device_map="auto",
+    )
+    return model
+
+
+def _get_model_e5(base_model_name, adapter_model_name, for_training=True):
     base_model = AutoModel.from_pretrained(
         base_model_name, device_map="auto"
     )  # , torch_dtype=torch.float16)
@@ -168,7 +200,7 @@ def chaturvedi_doc2vec(anonymized: bool = False):
     dataset = MovieSummaryDataset(
         Path(os.environ["MOVIE_REMAKE_PATH"]) / "movieRemakesManuallyCleaned.tsv",
         Path(os.environ["MOVIE_REMAKE_PATH"]) / "testInstances.csv",
-        Path(os.environ["MOVIE_REMAKE_PATH"]) / "remakes-anon.csv",
+        (Path(os.environ["MOVIE_REMAKE_PATH"]) / "remakes-anon.csv") if anonymized else None,
     )
     texts = [s.text_anonymized if anonymized else s.text for s in dataset]
     cluster_ids = [s.cluster_id for s in dataset]
@@ -210,45 +242,40 @@ def chaturvedi(
     encode_query_separately: bool = False,
 ):
     """
-    Checkpoint  Score
-    ../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9 0.8047210300429185
-    e5-mistral-7b-instruct-adapters                                               0.45278969957081544
-    e5-mistral-7b-isntruct-adapters + query_prefix                                0.44206008583690987
-
-    anonymized:
-    ../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9 0.8068669527896996
-    e5-mistral-7b-instruct-adapters                                               0.16738197424892703
-    e5-mistral-7b-instruct-adapters + query prefix                                0.16523605150214593
     """
-    # TOdo: for e5 we need the task prefix to make it fair :/ (maybe, does it do symmetric embeddings)
     dataset = MovieSummaryDataset(
         Path(os.environ["MOVIE_REMAKE_PATH"]) / "movieRemakesManuallyCleaned.tsv",
         Path(os.environ["MOVIE_REMAKE_PATH"]) / "testInstances.csv",
-        Path(os.environ["MOVIE_REMAKE_PATH"]) / "remakes-anon.csv",
+        (Path(os.environ["MOVIE_REMAKE_PATH"]) / "remakes-anon.csv") if anonymized else None,
     )
-    base_model_name = "mistralai/Mistral-7B-v0.1"
-    model = get_model(base_model_name, model_path, for_training=False).to("cuda:0")
-    # model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
-    model = model.to(torch.float16)
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    if model_path.startswith("sentence-t5"):
+        model = SentenceTransformer(model_path).to("cuda:0")
+    else:
+        base_model_name = "mistralai/Mistral-7B-v0.1"
+        model = get_model(base_model_name, model_path, for_training=False).to("cuda:0")
+        # model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
+        model = model.to(torch.float16)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     texts = [s.text_anonymized if anonymized else s.text for s in dataset]
     cluster_ids = [s.cluster_id for s in dataset]
     movie_ids = [s.movie_id for s in dataset]
     encoded = []
     encoded_queries = []
-    # query_prefix = ""
     print(QUERY_PREFIX)
     with torch.no_grad():
         for text in tqdm(texts):
-            batch = tokenizer(QUERY_PREFIX + text, return_tensors="pt")
-            output = model(**batch.to("cuda:0"))
-            encoded.append(output.last_hidden_state[:, -1].to("cpu").squeeze())
-            if encode_query_separately:
-                batch_query = tokenizer(QUERY_PREFIX + text, return_tensors="pt")
-                output = model(**batch_query.to("cuda:0"))
-                encoded_queries.append(
-                    output.last_hidden_state[:, -1].to("cpu").squeeze()
-                )
+            if model_path.startswith("sentence-t5"):
+                encoded.append(model.encode([text], convert_to_tensor=True).squeeze().cpu())
+            else:
+                batch = tokenizer(QUERY_PREFIX + text, return_tensors="pt")
+                output = model(**batch.to("cuda:0"))
+                encoded.append(output.last_hidden_state[:, -1].to("cpu").squeeze())
+                if encode_query_separately:
+                    batch_query = tokenizer(QUERY_PREFIX + text, return_tensors="pt")
+                    output = model(**batch_query.to("cuda:0"))
+                    encoded_queries.append(
+                        output.last_hidden_state[:, -1].to("cpu").squeeze()
+                    )
     encoded = torch.stack(encoded)
     if encode_query_separately:
         encoded_queries = torch.stack(encoded_queries)
@@ -257,8 +284,6 @@ def chaturvedi(
         similarities = cos_sim(encoded, encoded)
     similarities.fill_diagonal_(0)
     match = similarities.argmax(1)
-    # ds = ReplacementDataset(texts[5:8])
-    # breakpoint()
     total = 0
     correct = 0
     for a, b in enumerate(match):
@@ -268,6 +293,13 @@ def chaturvedi(
             correct += 1
         total += 1
     print(correct / total)
+    gold_sim_matrix = label_list_to_matrix(torch.tensor(cluster_ids))[
+        [x in dataset.test_movies for x in movie_ids]
+    ]
+    test_similarities = similarities[[x in dataset.test_movies for x in movie_ids]]
+    eval_result = eval_similarities(gold_sim_matrix, test_similarities)
+    print(eval_result)
+    print_eval_result(eval_result)
 
 
 @app.command()
@@ -376,32 +408,18 @@ def label_list_to_matrix(labels):
     return out
 
 
-@app.command()
-def test(
-    adapter_paths: List[str],
-    use_anonymized: bool = True,
-    min_length: int = 0,
-    batch_size: int = 1,
-    split: str = "dev",
-    quick: bool = False,
-    collect_lengths: bool = False,
-    save_embeddings: Optional[str] = None,
-):
-    base_model_name = "mistralai/Mistral-7B-v0.1"
-    # model = get_model(base_model_name, "sim-trainer2024-02-21T19:26:14.519764/checkpoint-1500/", for_training=False).to("cuda:0"): 0.88
-    ds = tell_me_again.StoryDataset()
-    splits = ds.perform_splits()
-    if use_anonymized:
+def get_text_list(anonymized, min_sentences, split):
+    if anonymized:
         all_labeled = list(
             itertools.chain.from_iterable(
                 [
                     zip(
                         itertools.repeat(i),
                         itertools.repeat(v.wikidata_id),
-                        v.get_anonymized(min_sentences=min_length).values(),
+                        v.get_anonymized(min_sentences=min_sentences).values(),
                     )
-                    for i, v in enumerate(splits[split].stories.values())
-                    if len(v.get_anonymized(min_sentences=min_length)) > 1
+                    for i, v in enumerate(split.stories.values())
+                    if len(v.get_anonymized(min_sentences=min_sentences)) > 1
                 ]
             )
         )
@@ -412,17 +430,37 @@ def test(
                     zip(
                         itertools.repeat(i),
                         itertools.repeat(v.wikidata_id),
-                        v.get_all_summaries_en(min_sentences=min_length)[1],
+                        v.get_all_summaries_en(min_sentences=min_sentences)[1],
                     )
-                    for i, v in enumerate(splits[split].stories.values())
-                    if len(v.get_anonymized(min_sentences=min_length)) > 1
+                    for i, v in enumerate(split.stories.values())
+                    if len(v.get_anonymized(min_sentences=min_sentences)) > 1
                 ]
             )
         )
+    return all_labeled
+
+
+@app.command()
+def test(
+    adapter_paths: List[str],
+    use_anonymized: bool = True,
+    min_length: int = 0,
+    batch_size: int = 1,
+    split: str = "dev",
+    quick: bool = False,
+    save_embeddings: Optional[str] = None,
+    base_model_name: str = "mistralai/Mistral-7B-v0.1",
+):
+    is_llm2vec = "LLM2Vec" in base_model_name
+    # model = get_model(base_model_name, "sim-trainer2024-02-21T19:26:14.519764/checkpoint-1500/", for_training=False).to("cuda:0"): 0.88
+    ds = tell_me_again.StoryDataset()
+    splits = ds.perform_splits()
+    all_labeled = get_text_list(use_anonymized, min_length, splits[split])
     labels, wiki_ids, texts = zip(*all_labeled)
     if quick:
-        labels = labels[:11]
-        texts = texts[:11]
+        labels = labels[:1002]
+        texts = texts[:1002]
+    print(texts[5])
     results_csv = open("results.csv", "w")
     for adapter_path in adapter_paths:
         model = get_model(base_model_name, adapter_path, for_training=False).to(
@@ -439,10 +477,11 @@ def test(
             batches.append(tokenized)
         model.eval()
         batches_encoded = []
+        pooling = get_repr if not is_llm2vec else get_repr_mean
         with torch.no_grad():
             for batch in tqdm(batches):
                 output = model(**batch.to("cuda:0"))
-                batches_encoded.append(output.last_hidden_state[:, -1].to("cpu"))
+                batches_encoded.append(pooling(output).cpu())
         encoded = torch.cat(batches_encoded)
         similarities = cos_sim(encoded, encoded)
         similarities.fill_diagonal_(0)
@@ -460,11 +499,10 @@ def test(
         )
         print(eval_result)
         print_eval_result(eval_result)
-        if save_embeddings:
+        if save_embeddings is not None:
             out_file = open(save_embeddings, "wb")
             out_file_ids = open(save_embeddings + ".json", "w")
             torch.save(encoded, out_file)
-            breakpoint()
             json.dump(wiki_ids, out_file_ids)
         # With anonymization: 0.139
         # W/o anonymiztaion: 0.596
@@ -545,6 +583,7 @@ def test_doc2vec(
 @dataclass
 class DataCollatorForSimilarityModeling:
     tokenizer: PreTrainedTokenizerBase
+    max_input_length: int
 
     def __call__(self, samples):
         texts_a = self.tokenizer(
@@ -552,14 +591,14 @@ class DataCollatorForSimilarityModeling:
             return_tensors="pt",
             padding="max_length",
             truncation=True,
-            max_length=MAX_INPUT_LENGTH,
+            max_length=self.max_input_length,
         )
         texts_b = self.tokenizer(
             [sample["text_b"] for sample in samples],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
-            max_length=MAX_INPUT_LENGTH,
+            max_length=self.max_input_length,
         )
         ids = torch.tensor([[int(id_[1:]) for id_ in s["text_ids"]] for s in samples])
         ids_a = ids[:, 0]
@@ -581,15 +620,12 @@ def clip_texts(item):
     return item
 
 
-class GradientCacheCallbacks(TrainerCallback):
-    pass
-
-
 @app.command()
-def train():
+def train(anonymized: bool = True):
     timestamp = datetime.utcnow().isoformat()
     ds = dataset.SimilarityDataset(
         "data",
+        anonymized=anonymized,
         negative_sample_scale=0.0,
         min_sentences=10,
         max_sentences=50,
@@ -602,8 +638,8 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
-    effective_batch_size = 256
-    base_lr = 1e-5
+    effective_batch_size = 1024
+    base_lr = 5e-5
     # effective_lr = base_lr * effective_batch_size / 1024 # Recommended in https://arxiv.org/pdf/2304.12210.pdf
     optimizer = torch.optim.Adam(
         [p for name, p in model.named_parameters() if "lora" in name], lr=base_lr
@@ -629,7 +665,7 @@ def train():
         training_args,
         train_dataset=ds["train"].map(clip_texts),
         eval_dataset=ds["dev"].map(clip_texts),
-        data_collator=DataCollatorForSimilarityModeling(tokenizer),
+        data_collator=DataCollatorForSimilarityModeling(tokenizer, MAX_INPUT_LENGTH),
         optimizers=[optimizer, None],
     )
     trainer.train()
@@ -642,8 +678,7 @@ def train_llm2vec():
         "data",
         negative_sample_scale=0.0,
         min_sentences=10,
-        max_sentences=50,
-        clusters_together=True,
+        max_sentences=30,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp"
@@ -690,7 +725,7 @@ def train_llm2vec():
         training_args,
         train_dataset=ds["train"].map(clip_texts),
         eval_dataset=ds["dev"].map(clip_texts),
-        data_collator=DataCollatorForSimilarityModeling(tokenizer),
+        data_collator=DataCollatorForSimilarityModeling(tokenizer, 2500),
         optimizers=[optimizer, None],
     )
     trainer.train()
@@ -710,22 +745,33 @@ def prepare_model_and_tokenizer(base_model_name, adapter_name):
 def roc_stories(
     split: str = "dev",
     adapter_name: str = "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9",
+    use_t5_xxl: bool = False,
 ):
-    base_model_name = "mistralai/Mistral-7B-v0.1"
-    # model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters").to("cuda:0")
-    model, tokenizer = prepare_model_and_tokenizer(base_model_name, adapter_name)
+    
+    if not use_t5_xxl:
+        base_model_name = "mistralai/Mistral-7B-v0.1"
+        # model = get_model(base_model_name, "e5-mistral-7b-instruct-adapters").to("cuda:0")
+        model, tokenizer = prepare_model_and_tokenizer(base_model_name, adapter_name)
+    else:
+        model = SentenceTransformer("sentence-transformers/sentence-t5-xxl").to("cuda:0")
     ds = ROCStoriesDataset("../roc_stories", split)
     labels = []
     predictions = []
     with torch.no_grad():
         for item in tqdm(ds):
-            anchor = QUERY_PREFIX + " ".join(item.sentences)
-            choices = [anchor + " " + s for s in item.candidate_endings]
-            batch = tokenizer([anchor] + choices, return_tensors="pt", padding=True).to(
-                "cuda:0"
-            )
-            encoded = model(**batch)
-            sim = get_repr(encoded) @ get_repr(encoded).transpose(0, 1)
+            if not use_t5_xxl:
+                anchor = QUERY_PREFIX + " ".join(item.sentences)
+                choices = [anchor + " " + s for s in item.candidate_endings]
+                batch = tokenizer([anchor] + choices, return_tensors="pt", padding=True).to(
+                    "cuda:0"
+                )
+                encoded = model(**batch)
+                sim = get_repr(encoded) @ get_repr(encoded).transpose(0, 1)
+            else:
+                anchor = " ".join(item.sentences)
+                choices = [anchor + " " + s for s in item.candidate_endings]
+                encoded = model.encode([anchor] + choices, convert_to_tensor=True)
+                sim = encoded @ encoded.T
             prediction = (sim[0][1] < sim[0][2]).int()
             predictions.append(prediction)
             labels.append(item.label)
@@ -751,15 +797,11 @@ def roc_stories(
 
 
 @app.command()
-def genres():
+def genres(
+    adapter_name: str = "e5-mistral-7b-instruct-adapters",
+):
     """
     Distinguishing between crime and thriller is more or less impossible for our models
-    e5: 0.017751
-    ../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9: 0.042648430
-
-    Crime vs romance:
-    e5: 0.03778897459761644
-    ../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9: 0.11215
 
     This can be considered a bit of an improvement, but we will need to check tsne tbh.
     Either way: there is a slight improvement but it is not enough for any usecase. Hardly surprising as we are essentially also training on this (but keep in mind there are many overlapping samples in the training data).
@@ -767,10 +809,6 @@ def genres():
     This function is somehow not quite deterministic i.e. I had different sizes for the categories.
     """
     base_model_name = "mistralai/Mistral-7B-v0.1"
-    adapter_name = (
-        "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9"
-    )
-    # adapter_name = "e5-mistral-7b-instruct-adapters"
     model, tokenizer = prepare_model_and_tokenizer(base_model_name, adapter_name)
     genre_to_id = {
         x.split(",")[0]: x.split(",")[1]
@@ -828,15 +866,49 @@ def genres():
 
 
 @app.command()
-def sim_delta():
+def sim_delta(embs_a: str, embs_b: str):
     """
     Find texts with a very large delta in similarity from one model to another.
     """
-    stories = tell_me_again.StoryDataset().perform_splits()["dev"]
-    for story in stories:
-        en_summary = story.summaries_original.get("en")
-        if en_summary is not None:
-            en_summary
+    embs_a = torch.load(open(embs_a, "rb")).to("cuda:0")
+    embs_b = torch.load(open(embs_b, "rb")).to("cuda:0")
+    embs_a = torch.nn.functional.normalize(embs_a, 2, -1)
+    embs_b = torch.nn.functional.normalize(embs_b, 2, -1)
+
+    ds = tell_me_again.StoryDataset()
+    splits = ds.perform_splits()
+    all_labeled = get_text_list(False, 0, splits["dev"])
+    labels, wiki_ids, texts = zip(*all_labeled)
+    assert len(labels) == embs_a.shape[0]
+    embs_a_sim = (embs_a @ embs_a.T)
+    # embs_a_sim.fill_diagonal_(0)
+    embs_b_sim = (embs_b @ embs_b.T)
+    # embs_b_sim.fill_diagonal_(0)
+    values, indices = (embs_a_sim - embs_b_sim).flatten().topk(3, largest=True)
+    print("Pairs that have become less similar:")
+    for index in indices:
+        x, y = index // embs_a.shape[0], index % embs_a.shape[0]
+        print("==================")
+        print(x, y)
+        print(wiki_ids[x], wiki_ids[y])
+        print("#")
+        print(texts[x])
+        print("------------------")
+        print(texts[y])
+    values, indices = (embs_a_sim - embs_b_sim).flatten().topk(3, largest=False)
+    print("Pairs that have become more similar:")
+    # TODO: we may want to remove those that are labled as identical anyways
+    for index in indices:
+        x, y = index // embs_a.shape[0], index % embs_a.shape[0]
+        print("==================")
+        print(x, y)
+        print(wiki_ids[x], wiki_ids[y])
+        print("#")
+        print(texts[x])
+        print("------------------")
+        print(texts[y])
+    breakpoint()
+    wiki_ids[indices.item()]
     # Output some html here
 
 
@@ -891,6 +963,76 @@ def retellings(
         total += 1
     print(correct / total)
 
+
+@app.command()
+def embed_novels(adapter_path: str):
+    import glob
+
+    base_model_name = "mistralai/Mistral-7B-v0.1"
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    model = get_model(base_model_name, adapter_path)
+    embedding_ids = []
+    embeddings = []
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+    i = 0
+    with torch.no_grad():
+        for fn in tqdm(glob.glob("../gutenberg/detective_novels/novels/*/*_summary.txt")):
+            print(fn)
+            i += 1
+            # if i > 3:
+            #     break
+            full_text = "".join(open(fn).readlines())
+            text_id = fn.split("/")[-2]
+            split_id = fn.split("/")[-1].split("_")[0]
+            try:
+                intro, summary = full_text.split("\n\n", 1)
+                print(intro)
+            except ValueError:
+                print("skipped")
+                pass
+            tokenized = tokenizer(summary, return_tensors="pt")
+            output = model(**tokenized.to("cuda:0"))
+            embedding_ids.append(text_id + "_" + split_id)
+            embeddings.append(get_repr(output).cpu())
+            print("embedded", text_id, split_id)
+    torch.save(torch.stack(embeddings), open("novels-embedded.pt", "wb"))
+    json.dump(embedding_ids, open("novels-embedded-ids.json", "w"))
+
+@app.command()
+def sbert_test(use_anonymized: bool = False, split: str = "dev", quick: bool = False):
+    from sentence_transformers.util import cos_sim
+    from sentence_transformers import SentenceTransformer, models
+
+    ds = tell_me_again.StoryDataset()
+    splits = ds.perform_splits()
+    all_labeled = get_text_list(use_anonymized, 0, splits[split])
+    labels, wiki_ids, texts = zip(*all_labeled)
+    if quick:
+        labels = labels[:11]
+        texts = texts[:11]
+    model_names = ["sentence-transformers/sentence-t5-xxl"]
+    #out_file = open(f"sbert-{split}-tell-me-again.csv", "w")
+    for model_name in model_names:
+        model = SentenceTransformer(model_name)
+        encoded = model.encode([t for t in texts], show_progress_bar=True)
+        similarities = cos_sim(encoded, encoded)
+        similarities.fill_diagonal_(0)
+        matches = similarities.argmax(1)
+        correct = 0
+        total = 0
+        for source, match in enumerate(matches):
+            if labels[source] == labels[match]:
+                correct += 1
+            total += 1
+        print(model_name, "P@1", correct / total)
+        eval_result = eval_similarities(
+            label_list_to_matrix(torch.tensor(labels)), similarities
+        )
+        print(eval_result)
+        print_eval_result(eval_result)
 
 if __name__ == "__main__":
     app()
