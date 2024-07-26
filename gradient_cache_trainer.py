@@ -34,17 +34,22 @@ def get_repr(v):
     state = v.last_hidden_state[:,-1]
     return functional.normalize(state, 2, -1)
 
+def get_repr_mean(v):
+    state = v.last_hidden_state.mean(dim=-2)
+    return functional.normalize(state, 2, -1)
+
 
 class GradientCacheTrainer(Trainer):
     def __init__(self, model, *args, **kwargs):
         self.loss_fn = ContrastiveMSELoss()
         super().__init__(model, *args, **kwargs)
+        self.repr_func = get_repr
         self.gradient_cache = GradCache(
             models=[model, model],
             chunk_sizes=2,
-            loss_fn=SimpleContrastiveLoss(),
+            loss_fn=self.loss_fn,
             # loss_fn=self.loss_fn,
-            get_rep_fn=get_repr,
+            get_rep_fn=self.repr_func,
             fp16=True,
             scaler="placeholder" # Scaler is not initilaized on the trainer yet, so we assign it in the training step
         )
@@ -53,7 +58,7 @@ class GradientCacheTrainer(Trainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
         self.gradient_cache.scaler = self.optimizer.scaler
-        
+
         loss = self.gradient_cache(inputs["texts_a"], inputs["texts_b"], target=inputs["labels"].to(torch.float), reduction="mean")
         print("Loss", loss)
 
@@ -102,13 +107,19 @@ class GradientCacheTrainer(Trainer):
         with torch.no_grad():
             loss = None
             with self.compute_loss_context_manager():
-                embs_a = model(**inputs["texts_a"])
-                embs_b = model(**inputs["texts_b"])
-                repr_a, repr_b = get_repr(embs_a), get_repr(embs_b)
+                embs_a = model(**inputs["texts_a"], use_cache=False)
+                embs_b = model(**inputs["texts_b"], use_cache=False)
+                repr_a, repr_b = self.repr_func(embs_a), self.repr_func(embs_b)
                 loss = self.loss_fn(repr_a, repr_b, target=inputs["labels"])
 
         return (loss, torch.cat([repr_a, repr_b]), inputs["labels"])
 
-    # def _get_train_sampler(self) -> Optional[Sampler]:
-    #     # We don't want to randomize the order...
-    #     return SequentialSampler(self.train_dataset)
+    def _get_train_sampler(self) -> Optional[Sampler]:
+        # We don't want to randomize the order...
+        return SequentialSampler(self.train_dataset)
+
+
+class LLM2VecGradientCacheTrainer(GradientCacheTrainer):
+    def __init__(self, model, *args, **kwargs):
+        super().__init__(model, *args, **kwargs)
+        self.repr_func = get_repr_mean

@@ -240,6 +240,7 @@ def chaturvedi(
     model_path: str = "e5-mistral-7b-instruct-adapters",
     anonymized: bool = False,
     encode_query_separately: bool = False,
+    distractor_path: Optional[str] = None,
 ):
     """
     """
@@ -248,6 +249,14 @@ def chaturvedi(
         Path(os.environ["MOVIE_REMAKE_PATH"]) / "testInstances.csv",
         (Path(os.environ["MOVIE_REMAKE_PATH"]) / "remakes-anon.csv") if anonymized else None,
     )
+    if distractor_path:
+        distractor_dataset = MovieSummaryDataset(
+            Path(distractor_path) / "movieRemakesManuallyCleaned.tsv",
+            Path(distractor_path) / "testInstances.csv",
+            (Path(distractor_path) / "remakes-anon.csv") if anonymized else None,
+        )
+    else:
+        distractor_dataset = []
     if model_path.startswith("sentence-t5"):
         model = SentenceTransformer(model_path).to("cuda:0")
     else:
@@ -256,9 +265,9 @@ def chaturvedi(
         # model = get_model(base_model_name, "../sim-trainer-checkpoints/sim-trainer2024-03-14T12:55:28.479641/checkpoint-9", for_training=False).to("cuda:0")
         model = model.to(torch.float16)
         tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    texts = [s.text_anonymized if anonymized else s.text for s in dataset]
-    cluster_ids = [s.cluster_id for s in dataset]
-    movie_ids = [s.movie_id for s in dataset]
+    texts = [s.text_anonymized if anonymized else s.text for s in dataset] + [s.text_anonymized if anonymized else s.text for s in distractor_dataset]
+    cluster_ids = [s.cluster_id for s in dataset] + [len(dataset) + i for i in range(len(distractor_dataset))] 
+    movie_ids = [s.movie_id for s in dataset] + ["NONE" for s in distractor_dataset]
     encoded = []
     encoded_queries = []
     print(QUERY_PREFIX)
@@ -408,7 +417,14 @@ def label_list_to_matrix(labels):
     return out
 
 
-def get_text_list(anonymized, min_sentences, split):
+def get_text_list(anonymized, min_sentences, split, limit_to_year=None, exclude_year=None):
+    assert not (exclude_year is not None and limit_to_year is not None)
+    if limit_to_year is not None:
+        stories = [s for s in split.stories.values() if min(s.release_years, default=None) == limit_to_year]
+    elif exclude_year is not None:
+        stories = [s for s in split.stories.values() if min(s.release_years, default=None) != exclude_year]
+    else:
+        stories = split.stories.values()
     if anonymized:
         all_labeled = list(
             itertools.chain.from_iterable(
@@ -418,7 +434,7 @@ def get_text_list(anonymized, min_sentences, split):
                         itertools.repeat(v.wikidata_id),
                         v.get_anonymized(min_sentences=min_sentences).values(),
                     )
-                    for i, v in enumerate(split.stories.values())
+                    for i, v in enumerate(stories)
                     if len(v.get_anonymized(min_sentences=min_sentences)) > 1
                 ]
             )
@@ -432,7 +448,7 @@ def get_text_list(anonymized, min_sentences, split):
                         itertools.repeat(v.wikidata_id),
                         v.get_all_summaries_en(min_sentences=min_sentences)[1],
                     )
-                    for i, v in enumerate(split.stories.values())
+                    for i, v in enumerate(stories)
                     if len(v.get_anonymized(min_sentences=min_sentences)) > 1
                 ]
             )
@@ -450,12 +466,15 @@ def test(
     quick: bool = False,
     save_embeddings: Optional[str] = None,
     base_model_name: str = "mistralai/Mistral-7B-v0.1",
+    limit_to_year: Optional[int] = None,
 ):
     is_llm2vec = "LLM2Vec" in base_model_name
     # model = get_model(base_model_name, "sim-trainer2024-02-21T19:26:14.519764/checkpoint-1500/", for_training=False).to("cuda:0"): 0.88
     ds = tell_me_again.StoryDataset()
     splits = ds.perform_splits()
-    all_labeled = get_text_list(use_anonymized, min_length, splits[split])
+    all_labeled = get_text_list(use_anonymized, min_length, splits[split], limit_to_year)
+    if limit_to_year is not None:
+        labels_distractors, _, distractor_texts = zip(*get_text_list(use_anonymized, 0, splits[split], exclude_year=limit_to_year))
     labels, wiki_ids, texts = zip(*all_labeled)
     if quick:
         labels = labels[:1002]
@@ -470,7 +489,7 @@ def test(
         tokenizer = AutoTokenizer.from_pretrained(base_model_name)
         batches = []
         texts = [QUERY_PREFIX + t for t in texts]  # let's not make them too long
-        for texts_for_batch in tqdm(more_itertools.chunked(texts, batch_size)):
+        for texts_for_batch in tqdm(more_itertools.chunked(texts + list(distractor_texts), batch_size)):
             tokenized = tokenizer(
                 texts_for_batch, return_tensors="pt", max_length=MAX_INPUT_LENGTH
             )
@@ -485,18 +504,11 @@ def test(
         encoded = torch.cat(batches_encoded)
         similarities = cos_sim(encoded, encoded)
         similarities.fill_diagonal_(0)
-        matches = similarities.argmax(1)
-        correct = 0
-        total = 0
-        for source, match in enumerate(matches):
-            if labels[source] == labels[match]:
-                correct += 1
-            total += 1
-        print(adapter_path, str(correct / total), sep="\t", file=results_csv)
-        print("P@1", correct / total)
-        eval_result = eval_similarities(
-            label_list_to_matrix(torch.tensor(labels)), similarities
-        )
+        gold_sim_matrix = label_list_to_matrix(
+            torch.tensor(labels + labels_distractors)
+        )[:len(labels),:]
+        test_similarities = similarities[:len(labels),:]
+        eval_result = eval_similarities(gold_sim_matrix, test_similarities)
         print(eval_result)
         print_eval_result(eval_result)
         if save_embeddings is not None:
@@ -930,6 +942,7 @@ def retellings(
     texts = [s.text_anonymized if anonymized else s.text for s in dataset]
     cluster_ids = [s.cluster_id for s in dataset]
     movie_ids = [s.movie_id for s in dataset]
+    breakpoint()
     encoded = []
     encoded_queries = []
     # query_prefix = ""
@@ -1002,13 +1015,17 @@ def embed_novels(adapter_path: str):
     json.dump(embedding_ids, open("novels-embedded-ids.json", "w"))
 
 @app.command()
-def sbert_test(use_anonymized: bool = False, split: str = "dev", quick: bool = False):
+def sbert_test(use_anonymized: bool = False, split: str = "dev", quick: bool = False, limit_to_year: Optional[int]=None):
     from sentence_transformers.util import cos_sim
     from sentence_transformers import SentenceTransformer, models
 
     ds = tell_me_again.StoryDataset()
     splits = ds.perform_splits()
-    all_labeled = get_text_list(use_anonymized, 0, splits[split])
+    all_labeled = get_text_list(use_anonymized, 0, splits[split], limit_to_year=limit_to_year)
+    if limit_to_year is not None:
+        labels_distractors, _, distractor_texts = zip(*get_text_list(use_anonymized, 0, splits[split], exclude_year=limit_to_year))
+    else:
+        distractor_texts = []
     labels, wiki_ids, texts = zip(*all_labeled)
     if quick:
         labels = labels[:11]
@@ -1017,20 +1034,29 @@ def sbert_test(use_anonymized: bool = False, split: str = "dev", quick: bool = F
     #out_file = open(f"sbert-{split}-tell-me-again.csv", "w")
     for model_name in model_names:
         model = SentenceTransformer(model_name)
-        encoded = model.encode([t for t in texts], show_progress_bar=True)
+        encoded = model.encode([t for t in texts] + list(distractor_texts), show_progress_bar=True)
         similarities = cos_sim(encoded, encoded)
         similarities.fill_diagonal_(0)
-        matches = similarities.argmax(1)
-        correct = 0
-        total = 0
-        for source, match in enumerate(matches):
-            if labels[source] == labels[match]:
-                correct += 1
-            total += 1
-        print(model_name, "P@1", correct / total)
-        eval_result = eval_similarities(
-            label_list_to_matrix(torch.tensor(labels)), similarities
-        )
+        #matches = similarities.argmax(1)
+        #correct = 0
+        #total = 0
+        #for source, match in enumerate(matches):
+        #    if labels[source] == labels[match]:
+        #        correct += 1
+        #    total += 1
+        #print(model_name, "P@1", correct / total)
+        # test_similarities = similarities[:len(labels)]
+        # eval_result = eval_similarities(
+        #     label_list_to_matrix(torch.tensor(labels)), test_similarities
+        # )
+        # print(eval_result)
+        # print_eval_result(eval_result)
+        ##gold_sim_matrix = label_list_to_matrix(torch.tensor(labels))[len(labels),:]
+        gold_sim_matrix = label_list_to_matrix(
+            torch.tensor(labels + labels_distractors)
+        )[:len(labels),:]
+        test_similarities = similarities[:len(labels),:]
+        eval_result = eval_similarities(gold_sim_matrix, test_similarities)
         print(eval_result)
         print_eval_result(eval_result)
 
