@@ -2,16 +2,16 @@
 
 This repository contains the code for both the papers "Tell Me Again! a Large-Scale Dataset of Multiple Summaries for the Same Story" and "Story Embeddings — Narrative-Focused Representations of Fictional Stories".
 
-The code is licensed under MIT
+The code is licensed under MIT.
 
-When using any of our code we kindly ask that you reference our paper:
+When using any of our code, we kindly ask that you reference our paper:
 ```
 @inproceedings{hatzel-biemann-2024-story-embeddings,
     title = "Story Embeddings -- Narrative-Focused Representations of Fictional Stories",
     author = "Hatzel, Hans Ole and Biemann, Chris",
-    booktitle = "Proceedings of the 62st Annual Meeting of the Association for Computational Linguistics",
+    booktitle = "Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics",
     year = "2024",
-    address = "Miami, Florida",
+    address = "Miami, Florida, USA",
     publisher = "Association for Computational Linguistics",
 }
 ```
@@ -22,7 +22,7 @@ The most important things you could be looking for are listed below:
 
 * Contrastive learning for story embeddings: `embeddings.py`
 * Retelling Dataset: `data/retellings/`
-* Dataset scraping: `main.py` unless you know what you are doing just `pip install tell-me again` instead!
+* Dataset scraping: `main.py` unless you know what you are doing, just `pip install tell-me-again` instead!
 
 ## Tell Me Again Data
 
@@ -30,6 +30,6 @@ You shouldn't need to scrape the Tell Me Again data yourself (unless you want to
 Instead just use [the package](https://github.com/uhh-lt/tell-me-again) `tell-me-again`.
 
 
-## Model Snapshots
+## Models
 
-To be relased, if you see this and need them feel free to write.
+Our model trained with augmented data is [available on huggingface](https://huggingface.co/uhhlt/story-emb).
